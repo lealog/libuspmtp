@@ -42,6 +42,8 @@ cmake --build build-shared --parallel
 - [ ] Library builds (static and shared)
 - [ ] `ctest` passes
 - [ ] Sanitizer run is clean (ASan + UBSan; see below)
+- [ ] Line coverage of `src/` stays at or above the threshold (see below);
+      new behaviour is covered by the tests that come with it
 - [ ] New behaviour has tests (`tests/`); public API changes have C and
       C++ consumer coverage where applicable
 - [ ] No new compiler warnings
@@ -66,6 +68,22 @@ cmake --build build-asan --parallel
 ASAN_OPTIONS=halt_on_error=1:detect_leaks=1 \
 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
 ctest --test-dir build-asan --output-on-failure
+```
+
+## Measuring test coverage
+
+The library can be instrumented for gcov; the `coverage` target reports line
+coverage of `src/` (generated protobuf code excluded) and fails below
+`LIBUSPMTP_COVERAGE_MIN_LINES` (default 70 %). It needs `gcovr`.
+
+```bash
+cmake -S . -B build-cov \
+    -DCMAKE_BUILD_TYPE=Debug \
+    -DLIBUSPMTP_BUILD_TESTS=ON \
+    -DLIBUSPMTP_COVERAGE=ON
+cmake --build build-cov --parallel
+ctest --test-dir build-cov --output-on-failure
+cmake --build build-cov --target coverage
 ```
 
 ## Verifying the examples end to end

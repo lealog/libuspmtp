@@ -99,3 +99,29 @@ jobs:
           ASAN_OPTIONS: halt_on_error=1:detect_leaks=1
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
         run: ctest --test-dir build --output-on-failure
+
+  coverage:
+    name: Line coverage of src/
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake build-essential libprotobuf-dev protobuf-compiler gcovr
+
+      - name: Configure (coverage)
+        run: |
+          cmake -B build-cov \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DLIBUSPMTP_BUILD_TESTS=ON \
+            -DLIBUSPMTP_COVERAGE=ON
+
+      - name: Build
+        run: cmake --build build-cov --parallel
+
+      - name: Test
+        run: ctest --test-dir build-cov --output-on-failure
+
+      - name: Coverage (fails below LIBUSPMTP_COVERAGE_MIN_LINES)
+        run: cmake --build build-cov --target coverage

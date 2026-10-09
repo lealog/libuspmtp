@@ -37,6 +37,7 @@ protobuf_generate_cpp(LIBUSPMTP_PROTO_SRCS LIBUSPMTP_PROTO_HDRS
 # ── Options ────────────────────────────────────────────────────────────────
 option(LIBUSPMTP_BUILD_SHARED "Build shared library (default: static)" OFF)
 option(LIBUSPMTP_BUILD_TESTS  "Build test executables" OFF)
+option(LIBUSPMTP_COVERAGE     "Instrument the library and tests for gcov line coverage" OFF)
 
 # ── Source files ───────────────────────────────────────────────────────────
 set(LIBUSPMTP_SOURCES
@@ -85,6 +86,32 @@ target_compile_options(libuspmtp PRIVATE
     $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:
         -Wall -Wextra -Wpedantic -Wno-unused-parameter>
 )
+
+# ── Coverage ───────────────────────────────────────────────────────────────
+# cmake -B build-cov -DLIBUSPMTP_BUILD_TESTS=ON -DLIBUSPMTP_COVERAGE=ON
+# cmake --build build-cov && ctest --test-dir build-cov && cmake --build build-cov --target coverage
+if(LIBUSPMTP_COVERAGE)
+    set(LIBUSPMTP_COVERAGE_MIN_LINES 70 CACHE STRING
+        "Minimum line coverage (percent) of src/ for the coverage target to succeed")
+    target_compile_options(libuspmtp PRIVATE --coverage -O0)
+    target_link_options(libuspmtp PUBLIC --coverage)
+    find_program(GCOVR_EXECUTABLE gcovr)
+    if(GCOVR_EXECUTABLE)
+        add_custom_target(coverage
+            COMMAND ${GCOVR_EXECUTABLE}
+                --root ${CMAKE_CURRENT_SOURCE_DIR}
+                --filter "src/.*"
+                --exclude ".*\\.pb\\.(cc|h)"
+                --print-summary
+                --fail-under-line ${LIBUSPMTP_COVERAGE_MIN_LINES}
+                ${CMAKE_CURRENT_BINARY_DIR}
+            WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+            COMMENT "Line coverage of src/ from the last test run (gcovr)"
+            VERBATIM)
+    else()
+        message(WARNING "LIBUSPMTP_COVERAGE is ON but gcovr was not found; the coverage target is unavailable")
+    endif()
+endif()
 
 # ── Tests ──────────────────────────────────────────────────────────────────
 if(LIBUSPMTP_BUILD_TESTS)
