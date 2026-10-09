@@ -193,6 +193,12 @@ public:
     /** Current per-request timeout. */
     std::chrono::seconds timeout() const;
 
+    /**
+     * Password for the agent's authenticated UDS sockets, sent in the UDS
+     * handshake of the next (re)connection. Empty (the default) sends none.
+     */
+    void set_password(std::string password);
+
     /* ── GET ─────────────────────────────────────────────────────────── */
 
     UspResult<GetResponse> get(const std::string& path);
@@ -295,6 +301,7 @@ private:
     std::string          endpoint_id_;
     std::string          agent_endpoint_id_;
     std::chrono::seconds timeout_{10};
+    std::string          password_;
 
     /* Shared session state across all copies. */
     std::shared_ptr<std::mutex>                     session_mutex_;

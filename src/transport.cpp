@@ -98,7 +98,8 @@ std::variant<Transport, TransportError>
 Transport::connect(const std::string& socket_path,
                    std::chrono::seconds io_timeout,
                    const std::string& endpoint_id,
-                   std::string* peer_endpoint_id)
+                   std::string* peer_endpoint_id,
+                   const std::string& password)
 {
     /* Create socket. */
     int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
@@ -143,7 +144,7 @@ Transport::connect(const std::string& socket_path,
     Transport t(fd);
 
     /* Handshake: send client ID, receive agent ID. */
-    if (auto err = t.send_handshake(endpoint_id))
+    if (auto err = t.send_handshake(endpoint_id, password))
         return *err;
 
     auto hs = t.recv_handshake();
@@ -253,10 +254,26 @@ std::variant<proto::Record, TransportError> Transport::recv() {
 
 /* ── Private helpers ────────────────────────────────────────────────────── */
 
-std::optional<TransportError> Transport::send_handshake(const std::string& endpoint_id) {
-    const uint8_t* ep = reinterpret_cast<const uint8_t*>(endpoint_id.data());
-    uint32_t tlv_value_len = static_cast<uint32_t>(endpoint_id.size());
-    uint32_t outer_len     = static_cast<uint32_t>(TLV_HEADER_SIZE) + tlv_value_len;
+/* Append one TLV (type, 4-byte big-endian length, value) to a frame payload. */
+static void append_tlv(std::vector<uint8_t>& out, uint8_t type, const std::string& value) {
+    uint32_t tlv_value_len = static_cast<uint32_t>(value.size());
+    out.push_back(type);
+    out.push_back(static_cast<uint8_t>((tlv_value_len >> 24) & 0xFFu));
+    out.push_back(static_cast<uint8_t>((tlv_value_len >> 16) & 0xFFu));
+    out.push_back(static_cast<uint8_t>((tlv_value_len >>  8) & 0xFFu));
+    out.push_back(static_cast<uint8_t>( tlv_value_len         & 0xFFu));
+    out.insert(out.end(), value.begin(), value.end());
+}
+
+std::optional<TransportError> Transport::send_handshake(const std::string& endpoint_id,
+                                                        const std::string& password) {
+    /* One frame: the Handshake TLV, plus a Password TLV when the socket needs one. */
+    std::vector<uint8_t> tlvs;
+    append_tlv(tlvs, FRAME_TYPE_HANDSHAKE, endpoint_id);
+    if (!password.empty())
+        append_tlv(tlvs, FRAME_TYPE_PASSWORD, password);
+
+    uint32_t outer_len = static_cast<uint32_t>(tlvs.size());
 
     if (auto e = write_all(UDS_SYNC.data(), UDS_SYNC.size())) return e;
 
@@ -268,19 +285,7 @@ std::optional<TransportError> Transport::send_handshake(const std::string& endpo
     };
     if (auto e = write_all(olen_buf, 4)) return e;
 
-    uint8_t ftype = FRAME_TYPE_HANDSHAKE;
-    if (auto e = write_all(&ftype, 1)) return e;
-
-    const uint8_t vlen_buf[4] = {
-        static_cast<uint8_t>((tlv_value_len >> 24) & 0xFFu),
-        static_cast<uint8_t>((tlv_value_len >> 16) & 0xFFu),
-        static_cast<uint8_t>((tlv_value_len >>  8) & 0xFFu),
-        static_cast<uint8_t>( tlv_value_len         & 0xFFu),
-    };
-    if (auto e = write_all(vlen_buf, 4)) return e;
-
-    if (!endpoint_id.empty())
-        if (auto e = write_all(ep, endpoint_id.size())) return e;
+    if (auto e = write_all(tlvs.data(), tlvs.size())) return e;
 
     return std::nullopt;
 }

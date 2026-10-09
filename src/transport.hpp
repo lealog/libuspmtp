@@ -66,6 +66,7 @@ inline constexpr uint32_t MAX_PAYLOAD_BYTES = 16u * 1024u * 1024u;
 inline constexpr uint8_t FRAME_TYPE_HANDSHAKE  = 1;
 inline constexpr uint8_t FRAME_TYPE_ERROR      = 2;
 inline constexpr uint8_t FRAME_TYPE_USP_RECORD = 3;
+inline constexpr uint8_t FRAME_TYPE_PASSWORD   = 4;
 
 /* ── Error type ─────────────────────────────────────────────────────────── */
 
@@ -134,7 +135,10 @@ public:
      * `io_timeout` as both the send and receive timeout, and complete the
      * UDS MTP handshake identifying this side as `endpoint_id`. If
      * `peer_endpoint_id` is non-null it receives the agent's endpoint ID
-     * from the handshake reply.
+     * from the handshake reply. A non-empty `password` is sent as a
+     * Password TLV in the handshake frame, which the agent's authenticated
+     * UDS sockets require (R-UDS of TR-369); it is ignored by the
+     * unauthenticated ones.
      *
      * Returns a ready Transport or a TransportError on failure.
      */
@@ -142,7 +146,8 @@ public:
     connect(const std::string& socket_path,
             std::chrono::seconds io_timeout,
             const std::string& endpoint_id,
-            std::string* peer_endpoint_id = nullptr);
+            std::string* peer_endpoint_id = nullptr,
+            const std::string& password = {});
 
     /** The underlying socket, for poll(). Ownership stays with the Transport. */
     int native_handle() const noexcept { return fd_; }
@@ -170,7 +175,8 @@ public:
 private:
     explicit Transport(int fd) : fd_(fd) {}
 
-    std::optional<TransportError> send_handshake(const std::string& endpoint_id);
+    std::optional<TransportError> send_handshake(const std::string& endpoint_id,
+                                                 const std::string& password);
     std::variant<std::vector<uint8_t>, TransportError> recv_handshake();
     std::variant<std::vector<uint8_t>, TransportError> read_frame();
 

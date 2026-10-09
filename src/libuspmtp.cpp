@@ -538,6 +538,16 @@ int usp_controller_get_supported_protocol(UspControllerHandle* handle) {
 }
 
 LIBUSP_API
+int usp_controller_set_password(UspControllerHandle* handle,
+                                const char*          password) {
+    return with_panic_boundary([&] {
+        if (!handle || !password) return USP_ERR_NULL_POINTER;
+        handle->controller.set_password(password);
+        return USP_OK;
+    });
+}
+
+LIBUSP_API
 int usp_controller_set_timeout(UspControllerHandle* handle, uint64_t timeout_secs) {
     return with_panic_boundary([&] {
         if (!handle) return USP_ERR_NULL_POINTER;

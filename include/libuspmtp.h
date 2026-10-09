@@ -570,6 +570,24 @@ int usp_controller_set_timeout(
     uint64_t timeout_secs);
 
 /*
+ * usp_controller_set_password
+ *
+ * Set the password sent in the UDS MTP handshake, which the agent's
+ * authenticated UDS sockets require. An empty string (the default) sends no
+ * Password TLV. Takes effect on the next (re)connection.
+ *
+ * Parameters:
+ *   handle   – non-NULL handle.
+ *   password – NUL-terminated password; must not be NULL.
+ *
+ * Returns: USP_OK or USP_ERR_NULL_POINTER.
+ */
+LIBUSP_API
+int usp_controller_set_password(
+    struct UspControllerHandle *handle,
+    const char *password);
+
+/*
  * usp_error_is_vendor_defined
  *
  * Return 1 if code is in the TR-369 vendor-defined range [7800, 7999],

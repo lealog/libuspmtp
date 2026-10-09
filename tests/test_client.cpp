@@ -154,6 +154,21 @@ static void test_set_timeout() {
     usp_controller_free(h);
 }
 
+static void test_set_password_guards() {
+    std::puts("test_set_password_guards");
+
+    CHECK_EQ(usp_controller_set_password(nullptr, "x"), USP_ERR_NULL_POINTER);
+
+    UspControllerHandle* h = usp_controller_new("/tmp/none.sock", "proto::app", "proto::agent", 1);
+    CHECK(h != nullptr);
+    if (h) {
+        CHECK_EQ(usp_controller_set_password(h, nullptr), USP_ERR_NULL_POINTER);
+        CHECK_EQ(usp_controller_set_password(h, "s3cret"), USP_OK);
+        CHECK_EQ(usp_controller_set_password(h, ""), USP_OK);
+        usp_controller_free(h);
+    }
+}
+
 static void test_last_error() {
     std::puts("test_last_error");
 
@@ -526,6 +541,165 @@ static void test_idle_session_request_latency() {
     ::unlink(sock_path.c_str());
 }
 
+
+/* Read one whole UDS frame payload (after sync + outer_len). */
+static bool read_uds_frame_payload(int fd, std::vector<uint8_t>& payload) {
+    uint8_t hdr[8];
+    if (!read_exact(fd, hdr, 8)) return false;
+    uint32_t len = (hdr[4]<<24)|(hdr[5]<<16)|(hdr[6]<<8)|hdr[7];
+    payload.assign(len, 0);
+    return read_exact(fd, payload.data(), len);
+}
+
+/* True if the handshake payload carries a Password TLV (type 4) with this value. */
+static bool handshake_has_password(const std::vector<uint8_t>& payload, const std::string& expected) {
+    size_t pos = 0;
+    while (pos + 5 <= payload.size()) {
+        uint8_t type = payload[pos];
+        uint32_t len = (payload[pos+1]<<24)|(payload[pos+2]<<16)|(payload[pos+3]<<8)|payload[pos+4];
+        pos += 5;
+        if (pos + len > payload.size()) return false;
+        if (type == 4 && std::string(payload.begin()+pos, payload.begin()+pos+len) == expected) return true;
+        pos += len;
+    }
+    return false;
+}
+
+/*
+ * Through the C API: an agent socket that requires a password rejects the handshake until
+ * usp_controller_set_password() is called; the next request then reconnects and succeeds.
+ */
+static void test_password_required_through_c_api() {
+    std::puts("test_password_required_through_c_api");
+
+    std::string sock_path = make_tmp_socket_path();
+    ::unlink(sock_path.c_str());
+    int srv_fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    sockaddr_un addr{};
+    addr.sun_family = AF_UNIX;
+    std::strncpy(addr.sun_path, sock_path.c_str(), sizeof(addr.sun_path) - 1);
+    if (srv_fd < 0 || ::bind(srv_fd, (sockaddr*)&addr, sizeof(addr)) != 0 || ::listen(srv_fd, 2) != 0) {
+        std::puts("  SKIP: cannot bind/listen");
+        return;
+    }
+
+    auto resp_bytes = build_get_resp_record("Device.DeviceInfo.SerialNumber", "SN-42");
+    proto::Record ack;
+    ack.version = "1.5"; ack.to_id = "proto::app"; ack.from_id = "proto::agent";
+    ack.record_type = proto::UdsConnectRecord{};
+    auto ack_frame = make_uds_frame(3, ack.encode());
+    std::string sid = "proto::agent";
+    auto hs_frame = make_uds_frame(1, std::vector<uint8_t>(sid.begin(), sid.end()));
+    auto resp_frame = make_uds_frame(3, resp_bytes);
+    std::string err_text = "Password required but none provided in UDS frame";
+    auto err_frame = make_uds_frame(2, std::vector<uint8_t>(err_text.begin(), err_text.end()));
+
+    std::thread server([&]() {
+        for (int conn = 0; conn < 3; ++conn) {              /* 1: rejected, 2: retry also rejected, 3: accepted */
+            int fd = ::accept(srv_fd, nullptr, nullptr);
+            if (fd < 0) return;
+            suppress_sigpipe(fd);
+            std::vector<uint8_t> hs;
+            if (!read_uds_frame_payload(fd, hs)) { ::close(fd); continue; }
+            if (!handshake_has_password(hs, "pw")) {
+                sock_write(fd, err_frame.data(), err_frame.size());
+                ::close(fd);
+                continue;
+            }
+            sock_write(fd, hs_frame.data(), hs_frame.size());
+            read_uds_frame(fd);                                  /* UDSConnectRecord */
+            sock_write(fd, ack_frame.data(), ack_frame.size());
+            read_uds_frame(fd);                                  /* GET */
+            sock_write(fd, resp_frame.data(), resp_frame.size());
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            ::close(fd);
+            return;
+        }
+    });
+
+    UspControllerHandle* h = usp_controller_new(sock_path.c_str(), "proto::app", "proto::agent", 5);
+    CHECK(h != nullptr);
+    if (h) {
+        char value[64] = {0};
+        int rc = usp_controller_get(h, "Device.DeviceInfo.SerialNumber", value, sizeof value);
+        CHECK_EQ(rc, USP_ERR_USP);
+        char err[256] = {0};
+        usp_controller_last_error(h, err, sizeof err);
+        CHECK(std::string(err).find("Password required") != std::string::npos);
+
+        CHECK_EQ(usp_controller_set_password(h, "pw"), USP_OK);
+        rc = usp_controller_get(h, "Device.DeviceInfo.SerialNumber", value, sizeof value);
+        CHECK_EQ(rc, USP_OK);
+        CHECK_EQ(std::string(value), "SN-42");
+        usp_controller_free(h);
+    }
+    server.join();
+    ::close(srv_fd);
+    ::unlink(sock_path.c_str());
+}
+
+
+/*
+ * Regression: destroying the controller while its session is up (the agent still holds the
+ * connection) must stop and join the worker. The worker used to own its SessionState, so when
+ * the controller was freed first the worker became the last owner and joined itself on exit.
+ */
+static void test_destroy_controller_while_connected() {
+    std::puts("test_destroy_controller_while_connected");
+
+    std::string sock_path = make_tmp_socket_path();
+    ::unlink(sock_path.c_str());
+    int srv_fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    sockaddr_un addr{};
+    addr.sun_family = AF_UNIX;
+    std::strncpy(addr.sun_path, sock_path.c_str(), sizeof(addr.sun_path) - 1);
+    if (srv_fd < 0 || ::bind(srv_fd, (sockaddr*)&addr, sizeof(addr)) != 0 || ::listen(srv_fd, 1) != 0) {
+        std::puts("  SKIP: cannot bind/listen");
+        return;
+    }
+
+    auto resp_bytes = build_get_resp_record("Device.DeviceInfo.SerialNumber", "SN-42");
+    proto::Record ack;
+    ack.version = "1.5"; ack.to_id = "proto::app"; ack.from_id = "proto::agent";
+    ack.record_type = proto::UdsConnectRecord{};
+    auto ack_frame = make_uds_frame(3, ack.encode());
+    std::string sid = "proto::agent";
+    auto hs_frame = make_uds_frame(1, std::vector<uint8_t>(sid.begin(), sid.end()));
+    auto resp_frame = make_uds_frame(3, resp_bytes);
+
+    std::promise<void> controller_gone;
+    auto gone = controller_gone.get_future();
+
+    std::thread server([&]() {
+        int fd = ::accept(srv_fd, nullptr, nullptr);
+        if (fd < 0) return;
+        suppress_sigpipe(fd);
+        read_uds_frame(fd);
+        sock_write(fd, hs_frame.data(), hs_frame.size());
+        read_uds_frame(fd);
+        sock_write(fd, ack_frame.data(), ack_frame.size());
+        read_uds_frame(fd);
+        sock_write(fd, resp_frame.data(), resp_frame.size());
+        gone.wait();                         /* keep the connection open until the controller is destroyed */
+        ::close(fd);
+    });
+
+    auto t0 = std::chrono::steady_clock::now();
+    {
+        UspController client(sock_path, "proto::app", "proto::agent");
+        client.set_timeout(std::chrono::seconds(5));
+        auto result = client.get("Device.DeviceInfo.SerialNumber");
+        CHECK(std::holds_alternative<GetResponse>(result));
+    }                                        /* destroyed while the session is still connected */
+    long ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+    CHECK(ms < 3000);                        /* the stop request wakes the worker; no 1 s poll wait, no self-join */
+    controller_gone.set_value();
+
+    server.join();
+    ::close(srv_fd);
+    ::unlink(sock_path.c_str());
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════
  * main
  * ═══════════════════════════════════════════════════════════════════════════ */
@@ -538,6 +712,7 @@ int main() {
     test_vendor_defined_error_codes();
     test_usp_controller_new_null();
     test_set_timeout();
+    test_set_password_guards();
     test_last_error();
     test_get_null_guard();
     test_not_implemented_stubs();
@@ -546,6 +721,8 @@ int main() {
     test_get_after_agent_drops_session(1800);
     test_get_after_agent_drops_session(0);
     test_idle_session_request_latency();
+    test_password_required_through_c_api();
+    test_destroy_controller_while_connected();
 
     std::printf("\n%s: %d passed, %d failed\n",
                 (g_fail == 0) ? "PASS" : "FAIL",

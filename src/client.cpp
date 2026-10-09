@@ -232,7 +232,7 @@ wait_for_non_notify(Transport& transport,
 
 void session_worker(std::stop_token stop_token,
                     Transport transport_in,
-                    std::shared_ptr<UspController::SessionState> state_ptr,
+                    UspController::SessionState* state_ptr,
                     std::chrono::seconds timeout,
                     std::string endpoint_id,
                     std::string agent_endpoint_id)
@@ -244,7 +244,7 @@ void session_worker(std::stop_token stop_token,
     /* Whatever way the worker exits, mark the session dead and fail anything still queued, so a caller
      * never waits on a future that no thread will ever fulfil. */
     struct DeadSessionGuard {
-        std::shared_ptr<UspController::SessionState> s;
+        UspController::SessionState* s;
         ~DeadSessionGuard() {
             std::unique_lock lk(s->cmd_mutex);
             s->dead = true;
@@ -538,6 +538,10 @@ std::chrono::seconds UspController::timeout() const {
     return timeout_;
 }
 
+void UspController::set_password(std::string password) {
+    password_ = std::move(password);
+}
+
 /* ── ensure_session ─────────────────────────────────────────────────────── */
 
 std::shared_ptr<UspController::SessionState> UspController::ensure_session() {
@@ -553,7 +557,7 @@ std::shared_ptr<UspController::SessionState> UspController::ensure_session() {
     /* Connect transport with a 1-second I/O timeout (for the worker poll). */
     std::string peer_id;
     auto transport_result = Transport::connect(
-        socket_path_, SESSION_IO_TIMEOUT, endpoint_id_, &peer_id);
+        socket_path_, SESSION_IO_TIMEOUT, endpoint_id_, &peer_id, password_);
 
     if (auto* err = std::get_if<TransportError>(&transport_result))
         throw *err; /* caller converts to UspError */
@@ -580,16 +584,19 @@ std::shared_ptr<UspController::SessionState> UspController::ensure_session() {
     if (!state->wake_pipe.open())
         throw TransportError::io("pipe() for session wake-up failed");
 
-    /* Capture shared_ptr to keep SessionState alive in the worker thread. */
-    auto state_shared = state;
+    /* The worker gets a plain pointer, never an owning reference: ~SessionState joins the
+     * worker before any member is destroyed (the jthread is declared last), and a worker
+     * that owned its own SessionState would end up joining itself when the controller is
+     * destroyed first (std::system_error "Resource deadlock avoided", then terminate). */
+    UspController::SessionState* state_raw = state.get();
     std::string ep = endpoint_id_;
     std::string aep = agent_endpoint_id_;
     std::chrono::seconds to = timeout_;
 
     state->worker = std::jthread(
-        [state_shared, ep, aep, to](std::stop_token token, Transport t) {
+        [state_raw, ep, aep, to](std::stop_token token, Transport t) {
             session_worker(std::move(token), std::move(t),
-                           state_shared, to, ep, aep);
+                           state_raw, to, ep, aep);
         },
         std::move(transport));
 

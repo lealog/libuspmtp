@@ -34,6 +34,7 @@
 #include <cstring>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 /* POSIX */
@@ -112,6 +113,7 @@ static void test_constants() {
     CHECK_EQ(FRAME_TYPE_HANDSHAKE,  1u);
     CHECK_EQ(FRAME_TYPE_ERROR,      2u);
     CHECK_EQ(FRAME_TYPE_USP_RECORD, 3u);
+    CHECK_EQ(FRAME_TYPE_PASSWORD,   4u);
 }
 
 static void test_transport_error_kinds() {
@@ -300,6 +302,129 @@ static void test_handshake_and_send_recv() {
     server.join();
 }
 
+
+/* Read one whole UDS frame payload (everything after sync + outer_len). */
+static bool read_frame_payload(int fd, std::vector<uint8_t>& payload) {
+    uint8_t hdr[8];
+    size_t got = 0;
+    while (got < 8) {
+        ssize_t r = ::read(fd, hdr + got, 8 - got);
+        if (r <= 0) return false;
+        got += static_cast<size_t>(r);
+    }
+    uint32_t outer_len = (hdr[4] << 24) | (hdr[5] << 16) | (hdr[6] << 8) | hdr[7];
+    payload.assign(outer_len, 0);
+    got = 0;
+    while (got < outer_len) {
+        ssize_t r = ::read(fd, payload.data() + got, outer_len - got);
+        if (r <= 0) return false;
+        got += static_cast<size_t>(r);
+    }
+    return true;
+}
+
+/* Split a frame payload into (type, value) pairs. */
+static std::vector<std::pair<uint8_t, std::string>> split_tlvs(const std::vector<uint8_t>& payload) {
+    std::vector<std::pair<uint8_t, std::string>> out;
+    size_t pos = 0;
+    while (pos + TLV_HEADER_SIZE <= payload.size()) {
+        uint8_t type = payload[pos];
+        uint32_t len = (payload[pos+1] << 24) | (payload[pos+2] << 16) | (payload[pos+3] << 8) | payload[pos+4];
+        pos += TLV_HEADER_SIZE;
+        if (pos + len > payload.size()) break;
+        out.emplace_back(type, std::string(payload.begin() + pos, payload.begin() + pos + len));
+        pos += len;
+    }
+    return out;
+}
+
+static int listen_on(const std::string& sock_path) {
+    ::unlink(sock_path.c_str());
+    int srv_fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    if (srv_fd < 0) return -1;
+    sockaddr_un addr{};
+    addr.sun_family = AF_UNIX;
+    std::strncpy(addr.sun_path, sock_path.c_str(), sizeof(addr.sun_path) - 1);
+    if (::bind(srv_fd, (sockaddr*)&addr, sizeof(addr)) != 0 || ::listen(srv_fd, 1) != 0) {
+        ::close(srv_fd);
+        return -1;
+    }
+    return srv_fd;
+}
+
+/* The handshake frame carries a Password TLV exactly when a password is given, and nothing else changes. */
+static void test_handshake_password_tlv() {
+    std::puts("test_handshake_password_tlv");
+
+    for (int with_password = 0; with_password < 2; ++with_password) {
+        std::string sock_path = make_tmp_socket_path();
+        int srv_fd = listen_on(sock_path);
+        if (srv_fd < 0) { std::puts("  SKIP: cannot bind/listen"); return; }
+
+        std::vector<std::pair<uint8_t, std::string>> seen;
+        std::thread server([srv_fd, &seen]() {
+            int cli_fd = ::accept(srv_fd, nullptr, nullptr);
+            if (cli_fd < 0) { ::close(srv_fd); return; }
+            std::vector<uint8_t> payload;
+            if (read_frame_payload(cli_fd, payload)) seen = split_tlvs(payload);
+            auto reply = encode_uds_frame(FRAME_TYPE_HANDSHAKE, std::vector<uint8_t>{'p','r','o','t','o',':',':','s','r','v'});
+            ::write(cli_fd, reply.data(), reply.size());
+            ::close(cli_fd);
+            ::close(srv_fd);
+        });
+
+        std::string peer;
+        auto result = Transport::connect(sock_path, std::chrono::seconds(5), "proto::client", &peer,
+                                         with_password ? "s3cret" : "");
+        server.join();
+        ::unlink(sock_path.c_str());
+
+        CHECK(std::holds_alternative<Transport>(result));
+        CHECK_EQ(peer, "proto::srv");
+        CHECK_EQ(seen.size(), static_cast<size_t>(with_password ? 2 : 1));
+        if (!seen.empty()) {
+            CHECK_EQ(seen[0].first, FRAME_TYPE_HANDSHAKE);
+            CHECK_EQ(seen[0].second, "proto::client");
+        }
+        if (with_password && seen.size() == 2) {
+            CHECK_EQ(seen[1].first, FRAME_TYPE_PASSWORD);
+            CHECK_EQ(seen[1].second, "s3cret");
+        }
+    }
+}
+
+/* An Error TLV in reply to the handshake becomes a connection failure carrying the agent's text. */
+static void test_handshake_rejected_by_peer() {
+    std::puts("test_handshake_rejected_by_peer");
+
+    std::string sock_path = make_tmp_socket_path();
+    int srv_fd = listen_on(sock_path);
+    if (srv_fd < 0) { std::puts("  SKIP: cannot bind/listen"); return; }
+
+    std::thread server([srv_fd]() {
+        int cli_fd = ::accept(srv_fd, nullptr, nullptr);
+        if (cli_fd < 0) { ::close(srv_fd); return; }
+        std::vector<uint8_t> payload;
+        read_frame_payload(cli_fd, payload);
+        std::string text = "Password required but none provided in UDS frame";
+        auto reply = encode_uds_frame(FRAME_TYPE_ERROR, std::vector<uint8_t>(text.begin(), text.end()));
+        ::write(cli_fd, reply.data(), reply.size());
+        ::close(cli_fd);
+        ::close(srv_fd);
+    });
+
+    auto result = Transport::connect(sock_path, std::chrono::seconds(5), "proto::client");
+    server.join();
+    ::unlink(sock_path.c_str());
+
+    auto* err = std::get_if<TransportError>(&result);
+    CHECK(err != nullptr);
+    if (err) {
+        CHECK(err->kind() == TransportError::Kind::ConnectionFailed);
+        CHECK(err->message().find("Password required") != std::string::npos);
+    }
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════
  * main
  * ═══════════════════════════════════════════════════════════════════════════ */
@@ -313,6 +438,8 @@ int main() {
     test_uds_frame_encoding();
     test_connect_missing_socket();
     test_handshake_and_send_recv();
+    test_handshake_password_tlv();
+    test_handshake_rejected_by_peer();
 
     std::printf("\n%s: %d passed, %d failed\n",
                 (g_fail == 0) ? "PASS" : "FAIL",
