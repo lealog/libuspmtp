@@ -181,6 +181,7 @@ public:
     struct State;
 
 private:
+    UspResult<std::vector<RegisterResult>> start_once(const std::vector<std::string>& roots, bool allow_partial);
     std::optional<UspError> send_request_and_wait(proto::MsgType type, proto::Body body, proto::Msg& reply);
     void send_notify(const std::string& notif_type, const std::string& path, proto::Notify notify);
 

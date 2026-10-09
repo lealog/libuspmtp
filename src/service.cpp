@@ -864,6 +864,16 @@ UspResult<std::vector<RegisterResult>> UspService::start(const std::vector<std::
     if (roots.empty())
         return UspError::protocol("no paths to register");
 
+    /* A broker can drop a freshly connected peer once (seen on a gateway right after a container start); like
+     * the controller's round_trip(), a recoverable failure gets one more attempt on a new connection. */
+    auto result = start_once(roots, allow_partial);
+    if (auto* err = std::get_if<UspError>(&result); err && err->is_recoverable())
+        return start_once(roots, allow_partial);
+    return result;
+}
+
+UspResult<std::vector<RegisterResult>> UspService::start_once(const std::vector<std::string>& roots, bool allow_partial) {
+
     /* Connect and establish the session on the caller's thread, so a refusal is reported here. */
     std::string peer;
     auto transport_result = Transport::connect(socket_path_, SERVICE_IO_TIMEOUT, endpoint_id_, &peer, password_);

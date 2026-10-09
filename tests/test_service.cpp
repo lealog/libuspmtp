@@ -830,6 +830,61 @@ static void test_destroy_while_connected() {
 }
 
 
+
+/* The broker drops the first connection right after the handshake; start() must try once more and succeed. */
+static void test_start_retries_after_dropped_connection() {
+    std::puts("test_start_retries_after_dropped_connection");
+
+    std::string sock_path = make_tmp_socket_path();
+    int srv_fd = listen_unix(sock_path);
+    if (srv_fd < 0) { std::puts("  SKIP: cannot bind/listen"); return; }
+
+    int connections = 0;
+    std::thread broker([&]() {
+        for (int conn = 0; conn < 2; ++conn) {
+            int fd = ::accept(srv_fd, nullptr, nullptr);
+            if (fd < 0) return;
+            ++connections;
+            suppress_sigpipe(fd);
+            std::vector<std::pair<uint8_t, std::vector<uint8_t>>> tlvs;
+            read_tlvs(fd, tlvs);
+            std::string bid = "proto::broker";
+            write_frame(fd, make_uds_frame(1, std::vector<uint8_t>(bid.begin(), bid.end())));
+            if (conn == 0) { ::close(fd); continue; }             /* dropped before the Register can be answered */
+            read_record(fd);                                       /* UDSConnectRecord */
+            auto reg = read_msg(fd);
+            if (reg && reg->header) {
+                proto::RegisterResp resp;
+                proto::RegisteredPathResult ok;
+                ok.requested_path = "Device.TestApp.";
+                ok.oper_status = proto::RegisterOperationStatus{proto::RegisterOperationSuccess{"Device.TestApp."}};
+                resp.registered_path_results = {ok};
+                send_msg(fd, response_msg(reg->header->msg_id, resp));
+            }
+            read_msg(fd);                                          /* Deregister on stop */
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            ::close(fd);
+        }
+    });
+
+    TestApp app;
+    UspService service(sock_path, "proto::svc");
+    service.set_timeout(std::chrono::seconds(3));
+    app.describe(service);
+    auto started = service.start({"Device.TestApp."});
+    auto* results = std::get_if<std::vector<RegisterResult>>(&started);
+    CHECK(results != nullptr);
+    if (!results) {
+        std::fprintf(stderr, "  start: %s\n", std::get<UspError>(started).to_string().c_str());
+    }
+    CHECK(service.running());
+    service.stop();
+    broker.join();
+    CHECK_EQ(connections, 2);
+    ::close(srv_fd);
+    ::unlink(sock_path.c_str());
+}
+
 /* ── The same application through the C API, with C callbacks ───────────── */
 
 struct CStore {
@@ -1171,6 +1226,7 @@ int main() {
     test_full_exchange();
     test_error_replies();
     test_destroy_while_connected();
+    test_start_retries_after_dropped_connection();
     test_c_api_guards();
     test_c_api_exchange();
 
