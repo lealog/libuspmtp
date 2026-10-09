@@ -253,6 +253,7 @@ public:
         std::mutex                cmd_mutex;
         std::condition_variable   cmd_cv;
         std::jthread              worker;
+        bool                      dead{false}; /* guarded by cmd_mutex; set when the worker has exited */
 
         ~SessionState(); /* join happens in jthread destructor */
     };

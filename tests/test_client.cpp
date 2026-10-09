@@ -33,6 +33,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <future>
 #include <thread>
 #include <vector>
 
@@ -370,6 +371,93 @@ static void test_get_with_mock_agent() {
     }
 }
 
+/*
+ * Regression: if the agent drops an idle session, the worker thread exits.  The next request must open a new
+ * session and succeed; before the fix it was queued onto the dead worker and its future never completed.
+ */
+static bool read_exact(int fd, void* buf, size_t n) {
+    auto* p = static_cast<uint8_t*>(buf);
+    while (n > 0) {
+        ssize_t r = ::read(fd, p, n);
+        if (r <= 0) return false;
+        p += r; n -= static_cast<size_t>(r);
+    }
+    return true;
+}
+
+static bool read_uds_frame(int fd) {
+    uint8_t hdr[8];
+    if (!read_exact(fd, hdr, 8)) return false;
+    uint32_t len = (hdr[4]<<24)|(hdr[5]<<16)|(hdr[6]<<8)|hdr[7];
+    std::vector<uint8_t> body(len);
+    return read_exact(fd, body.data(), len);
+}
+
+static void test_get_after_agent_drops_session() {
+    std::puts("test_get_after_agent_drops_session");
+
+    std::string sock_path = make_tmp_socket_path();
+    ::unlink(sock_path.c_str());
+    int srv_fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    sockaddr_un addr{};
+    addr.sun_family = AF_UNIX;
+    std::strncpy(addr.sun_path, sock_path.c_str(), sizeof(addr.sun_path) - 1);
+    if (srv_fd < 0 || ::bind(srv_fd, (sockaddr*)&addr, sizeof(addr)) != 0 || ::listen(srv_fd, 2) != 0) {
+        std::puts("  SKIP: cannot bind/listen");
+        return;
+    }
+
+    auto resp_bytes = build_get_resp_record("Device.DeviceInfo.SerialNumber", "SN-42");
+    proto::Record ack;
+    ack.version = "1.5"; ack.to_id = "proto::app"; ack.from_id = "proto::agent";
+    ack.record_type = proto::UdsConnectRecord{};
+    auto ack_frame = make_uds_frame(3, ack.encode());
+    std::string sid = "proto::agent";
+    auto hs_frame = make_uds_frame(1, std::vector<uint8_t>(sid.begin(), sid.end()));
+    auto resp_frame = make_uds_frame(3, resp_bytes);
+
+    std::thread server([&]() {
+        for (int conn = 0; conn < 2; ++conn) {
+            int fd = ::accept(srv_fd, nullptr, nullptr);
+            if (fd < 0) return;
+            suppress_sigpipe(fd);
+            read_uds_frame(fd);                                  /* client handshake */
+            sock_write(fd, hs_frame.data(), hs_frame.size());
+            read_uds_frame(fd);                                  /* UDSConnectRecord */
+            sock_write(fd, ack_frame.data(), ack_frame.size());
+            read_uds_frame(fd);                                  /* GET */
+            sock_write(fd, resp_frame.data(), resp_frame.size());
+            if (conn == 0) {
+                ::close(fd);                                     /* drop the idle session */
+                std::this_thread::sleep_for(std::chrono::milliseconds(2500));
+            } else {
+                std::this_thread::sleep_for(std::chrono::milliseconds(300));
+                ::close(fd);
+            }
+        }
+    });
+
+    UspController client(sock_path, "proto::app", "proto::agent");
+    client.set_timeout(std::chrono::seconds(5));
+
+    auto first = client.get("Device.DeviceInfo.SerialNumber");
+    CHECK(std::holds_alternative<GetResponse>(first));
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(1800)); /* let the idle worker notice EOF and stop */
+
+    auto fut = std::async(std::launch::async, [&] { return client.get("Device.DeviceInfo.SerialNumber"); });
+    if (fut.wait_for(std::chrono::seconds(12)) != std::future_status::ready) {
+        std::fputs("  FAIL: get() hung on a dead session\n", stderr);
+        std::_Exit(1);
+    }
+    auto second = fut.get();
+    CHECK(std::holds_alternative<GetResponse>(second));
+
+    server.join();
+    ::close(srv_fd);
+    ::unlink(sock_path.c_str());
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════
  * main
  * ═══════════════════════════════════════════════════════════════════════════ */
@@ -387,6 +475,7 @@ int main() {
     test_not_implemented_stubs();
     test_usp_controller_construction();
     test_get_with_mock_agent();
+    test_get_after_agent_drops_session();
 
     std::printf("\n%s: %d passed, %d failed\n",
                 (g_fail == 0) ? "PASS" : "FAIL",

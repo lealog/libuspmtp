@@ -235,6 +235,25 @@ void session_worker(std::stop_token stop_token,
     Transport transport = std::move(transport_in);
     std::vector<std::function<void()>> notify_callbacks;
 
+    /* Whatever way the worker exits, mark the session dead and fail anything still queued, so a caller
+     * never waits on a future that no thread will ever fulfil. */
+    struct DeadSessionGuard {
+        std::shared_ptr<UspController::SessionState> s;
+        ~DeadSessionGuard() {
+            std::unique_lock lk(s->cmd_mutex);
+            s->dead = true;
+            const auto err = UspError::connection_failed("USP session closed");
+            while (!s->commands.empty()) {
+                auto c = std::move(s->commands.front());
+                s->commands.pop();
+                if (auto* r = std::get_if<UspController::RequestCmd>(&c))
+                    r->reply.set_value(err);
+                else if (auto* sc = std::get_if<UspController::SubscribeCmd>(&c))
+                    sc->reply.set_value(err);
+            }
+        }
+    } dead_guard{state_ptr};
+
     while (!stop_token.stop_requested()) {
         /* 1. Non-blocking check for a pending command. */
         std::optional<UspController::WorkerCommand> cmd;
@@ -473,7 +492,12 @@ std::chrono::seconds UspController::timeout() const {
 std::shared_ptr<UspController::SessionState> UspController::ensure_session() {
     std::lock_guard lk(*session_mutex_);
 
-    if (*session_) return **session_;
+    if (*session_) {
+        auto existing = **session_;
+        std::lock_guard cl(existing->cmd_mutex);
+        if (!existing->dead) return existing;
+        *session_ = std::nullopt; /* worker is gone: reconnect below */
+    }
 
     /* Connect transport with a 1-second I/O timeout (for the worker poll). */
     std::string peer_id;
@@ -551,10 +575,14 @@ UspResult<proto::Record> UspController::round_trip(proto::Record record) {
 
         {
             std::unique_lock lk(state->cmd_mutex);
-            RequestCmd cmd;
-            cmd.record = record;
-            cmd.reply  = std::move(promise);
-            state->commands.emplace(std::move(cmd));
+            if (state->dead) {
+                promise.set_value(UspError::connection_failed("USP session closed"));
+            } else {
+                RequestCmd cmd;
+                cmd.record = record;
+                cmd.reply  = std::move(promise);
+                state->commands.emplace(std::move(cmd));
+            }
         }
         state->cmd_cv.notify_one();
 
@@ -595,11 +623,15 @@ std::optional<UspError> UspController::do_subscribe(
 
         {
             std::unique_lock lk(state->cmd_mutex);
-            SubscribeCmd cmd;
-            cmd.subscriptions = subs;
-            cmd.callback = callback;
-            cmd.reply = std::move(promise);
-            state->commands.emplace(std::move(cmd));
+            if (state->dead) {
+                promise.set_value(UspError::connection_failed("USP session closed"));
+            } else {
+                SubscribeCmd cmd;
+                cmd.subscriptions = subs;
+                cmd.callback = callback;
+                cmd.reply = std::move(promise);
+                state->commands.emplace(std::move(cmd));
+            }
         }
         state->cmd_cv.notify_one();
 
