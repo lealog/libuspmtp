@@ -37,9 +37,9 @@
  */
 
 #include "client.hpp"
+#include "session.hpp"
 
 #include <algorithm>
-#include <atomic>
 #include <cassert>
 #include <cerrno>
 #include <chrono>
@@ -54,14 +54,6 @@
 #include <tuple>
 
 namespace usp {
-
-/* ── Global message counter ─────────────────────────────────────────────── */
-
-static std::atomic<uint64_t> g_msg_counter{1};
-
-static std::string next_msg_id() {
-    return std::to_string(g_msg_counter.fetch_add(1, std::memory_order_relaxed));
-}
 
 /* ── Protocol version ───────────────────────────────────────────────────── */
 
@@ -89,44 +81,9 @@ wait_for_non_notify(Transport& transport,
                     const std::string& agent_endpoint_id,
                     std::vector<std::function<void()>>& callbacks);
 
-/* Build a USP Record wrapping an inner Msg. */
-static proto::Record build_record_fn(const std::string& from_id,
-                                     const std::string& to_id,
-                                     proto::MsgType msg_type,
-                                     proto::Body body)
-{
-    proto::Msg msg;
-    msg.header = proto::Header{next_msg_id(), msg_type};
-    msg.body   = std::move(body);
-
-    proto::NoSessionContextRecord nsc;
-    nsc.payload = msg.encode();
-
-    proto::Record rec;
-    rec.version         = "1.5";
-    rec.to_id           = to_id;
-    rec.from_id         = from_id;
-    rec.payload_security = 0; /* Plaintext */
-    rec.record_type     = std::move(nsc);
-    return rec;
-}
-
-/* Extract inner Msg from a NoSessionContextRecord. */
-static std::variant<proto::Msg, UspError> extract_msg(const proto::Record& record) {
-    const auto* nsc = std::get_if<proto::NoSessionContextRecord>(&record.record_type);
-    if (!nsc)
-        return UspError::protocol("expected NoSessionContextRecord in response");
-
-    auto msg = proto::Msg::decode(nsc->payload);
-    if (!msg)
-        return UspError::protocol("failed to decode inner Msg");
-
-    return std::move(*msg);
-}
-
 /* Check if this record contains a Notify, return it if so. */
 static std::optional<proto::Notify> extract_notify(const proto::Record& record) {
-    auto msg_var = extract_msg(record);
+    auto msg_var = detail::extract_msg(record);
     if (std::holds_alternative<UspError>(msg_var)) return std::nullopt;
 
     auto& msg = std::get<proto::Msg>(msg_var);
@@ -177,7 +134,7 @@ handle_notification_record(Transport& transport,
         proto::Body body;
         body.msg_body = std::move(resp);
 
-        auto resp_record = build_record_fn(endpoint_id, agent_endpoint_id,
+        auto resp_record = detail::build_record(endpoint_id, agent_endpoint_id,
                                            proto::MsgType::NotifyResp,
                                            std::move(body));
         transport.send(resp_record);
@@ -317,7 +274,7 @@ void session_worker(std::stop_token stop_token,
                 proto::Body body;
                 body.msg_body = std::move(req_body);
 
-                auto add_record = build_record_fn(endpoint_id, agent_endpoint_id,
+                auto add_record = detail::build_record(endpoint_id, agent_endpoint_id,
                                                   proto::MsgType::Add,
                                                   std::move(body));
 
@@ -330,7 +287,7 @@ void session_worker(std::stop_token stop_token,
                                                    notify_callbacks);
                     if (auto* rec = std::get_if<proto::Record>(&resp)) {
                         /* Parse ADD response. */
-                        auto msg_var = extract_msg(*rec);
+                        auto msg_var = detail::extract_msg(*rec);
                         if (auto* msg = std::get_if<proto::Msg>(&msg_var)) {
                             bool ok = false;
                             std::string err_detail;
@@ -430,56 +387,6 @@ void session_worker(std::stop_token stop_token,
     }
 }
 
-/* Complete the UDS session-establishment handshake.
- *
- * Returns nullopt on success.  On failure returns a TransportError that the
- * caller (ensure_session) converts and throws.
- *
- * The agent expects a UDSConnectRecord to begin a controller session; it
- * acknowledges with its own UDSConnectRecord before it will process
- * NoSessionContext requests.  Without this handshake the agent only ever
- * responds with a UDSConnectRecord and libuspmtp would report
- * "expected NoSessionContextRecord in response". */
-static std::optional<TransportError>
-establish_uds_session(Transport& transport,
-                      const std::string& from_id,
-                      const std::string& to_id,
-                      std::chrono::seconds timeout)
-{
-    proto::Record connect_record;
-    connect_record.version           = "1.5";
-    connect_record.to_id             = to_id;
-    connect_record.from_id           = from_id;
-    connect_record.payload_security  = 0;
-    connect_record.record_type       = proto::UdsConnectRecord{};
-
-    if (auto err = transport.send(connect_record))
-        return err;
-
-    /* Await the agent's UDSConnectRecord acknowledgement. */
-    auto deadline = std::chrono::steady_clock::now() + timeout;
-    while (std::chrono::steady_clock::now() < deadline) {
-        auto result = transport.recv();
-
-        if (auto* rec = std::get_if<proto::Record>(&result)) {
-            if (std::holds_alternative<proto::UdsConnectRecord>(rec->record_type))
-                return std::nullopt; /* Session established. */
-
-            /* Unexpected record at handshake. */
-            return TransportError::protocol(
-                "expected UDSConnectRecord during session establishment");
-        }
-
-        auto& err = std::get<TransportError>(result);
-        if (err.is_timeout())
-            continue; /* Keep waiting until the deadline. */
-        return err;
-    }
-
-    return TransportError::connection_failed(
-        "no UDS Connect acknowledgement from agent (session not established)");
-}
-
 } // anonymous namespace
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -575,7 +482,7 @@ std::shared_ptr<UspController::SessionState> UspController::ensure_session() {
      * establishes the USP session.  Send a UDSConnectRecord and wait for
      * the agent's UDSConnectRecord acknowledgement before any commands are
      * processed. */
-    if (auto connect_err = establish_uds_session(transport, endpoint_id_,
+    if (auto connect_err = detail::establish_uds_session(transport, endpoint_id_,
                                                   agent_endpoint_id_, timeout_)) {
         throw *connect_err;
     }
@@ -612,7 +519,7 @@ void UspController::clear_session() {
 /* ── build_record ───────────────────────────────────────────────────────── */
 
 proto::Record UspController::build_record(proto::MsgType msg_type, proto::Body body) const {
-    return build_record_fn(endpoint_id_, agent_endpoint_id_, msg_type, std::move(body));
+    return detail::build_record(endpoint_id_, agent_endpoint_id_, msg_type, std::move(body));
 }
 
 /* ── round_trip ─────────────────────────────────────────────────────────── */
@@ -1008,7 +915,7 @@ UspResult<GetResponse> UspController::get_many(const std::vector<std::string>& p
     auto result = round_trip(build_record(proto::MsgType::Get, std::move(body)));
     if (auto* err = std::get_if<UspError>(&result)) return *err;
 
-    auto msg_var = extract_msg(std::get<proto::Record>(result));
+    auto msg_var = detail::extract_msg(std::get<proto::Record>(result));
     if (auto* err = std::get_if<UspError>(&msg_var)) return *err;
 
     return parse_get_response(std::get<proto::Msg>(msg_var));
@@ -1034,7 +941,7 @@ UspResult<SetResponse> UspController::set_many(
     auto result = round_trip(build_record(proto::MsgType::Set, std::move(body)));
     if (auto* err = std::get_if<UspError>(&result)) return *err;
 
-    auto msg_var = extract_msg(std::get<proto::Record>(result));
+    auto msg_var = detail::extract_msg(std::get<proto::Record>(result));
     if (auto* err = std::get_if<UspError>(&msg_var)) return *err;
 
     return parse_set_response(std::get<proto::Msg>(msg_var));
@@ -1060,7 +967,7 @@ UspResult<OperateResponse> UspController::operate(
     auto result = round_trip(build_record(proto::MsgType::Operate, std::move(body)));
     if (auto* err = std::get_if<UspError>(&result)) return *err;
 
-    auto msg_var = extract_msg(std::get<proto::Record>(result));
+    auto msg_var = detail::extract_msg(std::get<proto::Record>(result));
     if (auto* err = std::get_if<UspError>(&msg_var)) return *err;
 
     auto op_result = parse_operate_response(std::get<proto::Msg>(msg_var));
@@ -1102,7 +1009,7 @@ UspResult<GetResponse> UspController::subscribe_many_and_get(
     /* Build subscription tuples: (sub_id, notif_type_str, path). */
     std::vector<std::tuple<std::string,std::string,std::string>> sub_tuples;
     for (auto& [path, notif_type] : subs) {
-        sub_tuples.emplace_back("sub-" + next_msg_id(),
+        sub_tuples.emplace_back("sub-" + detail::next_msg_id(),
                                 notif_type_str(notif_type),
                                 path);
     }
@@ -1149,7 +1056,7 @@ UspResult<AddResponse> UspController::add(
     auto result = round_trip(build_record(proto::MsgType::Add, std::move(body)));
     if (auto* err = std::get_if<UspError>(&result)) return *err;
 
-    auto msg_var = extract_msg(std::get<proto::Record>(result));
+    auto msg_var = detail::extract_msg(std::get<proto::Record>(result));
     if (auto* err = std::get_if<UspError>(&msg_var)) return *err;
 
     return parse_add_response(std::get<proto::Msg>(msg_var));
@@ -1169,7 +1076,7 @@ UspResult<DeleteResponse> UspController::delete_instance(const std::string& inst
     auto result = round_trip(build_record(proto::MsgType::Delete, std::move(body)));
     if (auto* err = std::get_if<UspError>(&result)) return *err;
 
-    auto msg_var = extract_msg(std::get<proto::Record>(result));
+    auto msg_var = detail::extract_msg(std::get<proto::Record>(result));
     if (auto* err = std::get_if<UspError>(&msg_var)) return *err;
 
     return parse_delete_response(std::get<proto::Msg>(msg_var));
@@ -1197,7 +1104,7 @@ UspResult<SupportedDMResponse> UspController::get_supported_dm(const std::string
     auto result = round_trip(build_record(proto::MsgType::GetSupportedDm, std::move(body)));
     if (auto* err = std::get_if<UspError>(&result)) return *err;
 
-    auto msg_var = extract_msg(std::get<proto::Record>(result));
+    auto msg_var = detail::extract_msg(std::get<proto::Record>(result));
     if (auto* err = std::get_if<UspError>(&msg_var)) return *err;
 
     return parse_supported_dm_response(std::get<proto::Msg>(msg_var));
@@ -1219,7 +1126,7 @@ UspResult<InstancesResponse> UspController::get_instances(const std::string& obj
     auto result = round_trip(build_record(proto::MsgType::GetInstances, std::move(body)));
     if (auto* err = std::get_if<UspError>(&result)) return *err;
 
-    auto msg_var = extract_msg(std::get<proto::Record>(result));
+    auto msg_var = detail::extract_msg(std::get<proto::Record>(result));
     if (auto* err = std::get_if<UspError>(&msg_var)) return *err;
 
     return parse_instances_response(std::get<proto::Msg>(msg_var));
@@ -1238,7 +1145,7 @@ UspResult<std::string> UspController::get_supported_protocol(const std::string& 
     auto result = round_trip(build_record(proto::MsgType::GetSupportedProto, std::move(body)));
     if (auto* err = std::get_if<UspError>(&result)) return *err;
 
-    auto msg_var = extract_msg(std::get<proto::Record>(result));
+    auto msg_var = detail::extract_msg(std::get<proto::Record>(result));
     if (auto* err = std::get_if<UspError>(&msg_var)) return *err;
 
     return parse_supported_protocol_response(std::get<proto::Msg>(msg_var));

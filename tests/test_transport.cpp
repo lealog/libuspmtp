@@ -181,6 +181,8 @@ static std::string make_tmp_socket_path() {
            "_" + std::to_string(++counter) + ".sock";
 }
 
+static bool read_frame_payload(int fd, std::vector<uint8_t>& payload);
+
 static void test_handshake_and_send_recv() {
     std::puts("test_handshake_and_send_recv");
 
@@ -218,16 +220,10 @@ static void test_handshake_and_send_recv() {
         int cli_fd = ::accept(srv_fd, nullptr, nullptr);
         if (cli_fd < 0) { ::close(srv_fd); return; }
 
-        /* Read client handshake frame. */
-        uint8_t sync[4];
-        ::read(cli_fd, sync, 4);
-
-        uint8_t olen_buf[4];
-        ::read(cli_fd, olen_buf, 4);
-        uint32_t outer_len = (olen_buf[0] << 24) | (olen_buf[1] << 16) |
-                             (olen_buf[2] << 8)  | olen_buf[3];
-        std::vector<uint8_t> hs(outer_len);
-        ::read(cli_fd, hs.data(), outer_len);
+        /* Read the whole client handshake frame: a short read here would leave bytes behind
+         * that the next frame read would mistake for a frame header. */
+        std::vector<uint8_t> hs;
+        read_frame_payload(cli_fd, hs);
 
         /* Send server handshake response. */
         std::string server_id = "proto::server";
@@ -247,14 +243,9 @@ static void test_handshake_and_send_recv() {
         }();
         ::write(cli_fd, hs_frame.data(), hs_frame.size());
 
-        /* Read a USP Record frame from client. */
-        uint8_t sync2[4];
-        ::read(cli_fd, sync2, 4);
-        uint8_t olen2[4];
-        ::read(cli_fd, olen2, 4);
-        uint32_t ol2 = (olen2[0]<<24)|(olen2[1]<<16)|(olen2[2]<<8)|olen2[3];
-        std::vector<uint8_t> payload2(ol2);
-        ::read(cli_fd, payload2.data(), ol2);
+        /* Read the whole USP Record frame from the client. */
+        std::vector<uint8_t> payload2;
+        read_frame_payload(cli_fd, payload2);
 
         /* Echo back a USP Record frame. */
         uint32_t vlen = rec_bytes.size();

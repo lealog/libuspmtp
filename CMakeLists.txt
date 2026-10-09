@@ -43,7 +43,9 @@ option(LIBUSPMTP_COVERAGE     "Instrument the library and tests for gcov line co
 set(LIBUSPMTP_SOURCES
     src/usp_proto.cpp
     src/transport.cpp
+    src/session.cpp
     src/client.cpp
+    src/service.cpp
     src/libuspmtp.cpp
     ${LIBUSPMTP_PROTO_SRCS}
     ${LIBUSPMTP_PROTO_HDRS}
@@ -117,7 +119,7 @@ endif()
 if(LIBUSPMTP_BUILD_TESTS)
     enable_testing()
 
-    foreach(test_name IN ITEMS test_proto test_transport test_client)
+    foreach(test_name IN ITEMS test_proto test_transport test_client test_service)
         add_executable(${test_name} tests/${test_name}.cpp)
         target_link_libraries(${test_name} PRIVATE libuspmtp::libuspmtp Threads::Threads)
         target_include_directories(${test_name} PRIVATE
