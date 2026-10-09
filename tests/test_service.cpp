@@ -210,12 +210,9 @@ static int broker_accept(int srv_fd, std::string* seen_password = nullptr) {
         if (type == 4 && seen_password) seen_password->assign(value.begin(), value.end());
     std::string bid = "proto::broker";
     write_frame(fd, make_uds_frame(1, std::vector<uint8_t>(bid.begin(), bid.end())));
-    auto connect = read_record(fd);                       /* the service's UDSConnectRecord */
+    /* The service sends its UDSConnectRecord; like OB-USPA's controller socket, the broker sends none back. */
+    auto connect = read_record(fd);
     if (!connect || !std::holds_alternative<proto::UdsConnectRecord>(connect->record_type)) { ::close(fd); return -1; }
-    proto::Record ack;
-    ack.version = "1.5"; ack.to_id = "proto::svc"; ack.from_id = "proto::broker";
-    ack.record_type = proto::UdsConnectRecord{};
-    send_record(fd, ack);
     return fd;
 }
 

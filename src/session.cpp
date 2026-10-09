@@ -81,7 +81,8 @@ std::variant<proto::Msg, UspError> extract_msg(const proto::Record& record) {
 std::optional<TransportError> establish_uds_session(Transport& transport,
                                                     const std::string& from_id,
                                                     const std::string& to_id,
-                                                    std::chrono::seconds timeout)
+                                                    std::chrono::seconds timeout,
+                                                    bool expect_ack)
 {
     proto::Record connect_record;
     connect_record.version           = "1.5";
@@ -92,6 +93,9 @@ std::optional<TransportError> establish_uds_session(Transport& transport,
 
     if (auto err = transport.send(connect_record))
         return err;
+
+    if (!expect_ack)
+        return std::nullopt;
 
     /* Await the peer's UDSConnectRecord acknowledgement. */
     auto deadline = std::chrono::steady_clock::now() + timeout;

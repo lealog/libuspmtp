@@ -872,7 +872,7 @@ UspResult<std::vector<RegisterResult>> UspService::start(const std::vector<std::
     Transport transport = std::move(std::get<Transport>(transport_result));
 
     std::string broker = broker_endpoint_id_.empty() ? peer : broker_endpoint_id_;
-    if (auto err = detail::establish_uds_session(transport, endpoint_id_, broker, timeout_))
+    if (auto err = detail::establish_uds_session(transport, endpoint_id_, broker, timeout_, /*expect_ack=*/false))
         return UspError::from_transport(*err);
 
     {

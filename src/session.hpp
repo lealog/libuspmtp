@@ -50,11 +50,17 @@ std::variant<proto::Msg, UspError> extract_msg(const proto::Record& record);
 
 /**
  * Complete the UDS session-establishment handshake: send our UDSConnectRecord
- * and wait for the peer's. Returns nullopt on success.
+ * and, when `expect_ack` is set, wait for the peer's. Returns nullopt on
+ * success.
+ *
+ * OB-USPA sends its own UDSConnectRecord only on its agent socket (to a
+ * connecting controller); a service connecting on the broker's controller
+ * socket sends one and gets nothing back, so a service passes false.
  */
 std::optional<TransportError> establish_uds_session(Transport& transport,
                                                     const std::string& from_id,
                                                     const std::string& to_id,
-                                                    std::chrono::seconds timeout);
+                                                    std::chrono::seconds timeout,
+                                                    bool expect_ack = true);
 
 } // namespace usp::detail
