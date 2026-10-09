@@ -93,7 +93,7 @@ target_compile_options(libuspmtp PRIVATE
 # cmake -B build-cov -DLIBUSPMTP_BUILD_TESTS=ON -DLIBUSPMTP_COVERAGE=ON
 # cmake --build build-cov && ctest --test-dir build-cov && cmake --build build-cov --target coverage
 if(LIBUSPMTP_COVERAGE)
-    set(LIBUSPMTP_COVERAGE_MIN_LINES 70 CACHE STRING
+    set(LIBUSPMTP_COVERAGE_MIN_LINES 75 CACHE STRING
         "Minimum line coverage (percent) of src/ for the coverage target to succeed")
     target_compile_options(libuspmtp PRIVATE --coverage -O0)
     target_link_options(libuspmtp PUBLIC --coverage)

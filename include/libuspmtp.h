@@ -94,6 +94,15 @@
  *     "KEY\t<instance path>\t<name>\t<value>\n"
  *     "ERROR\t<path>\t<err_code>\t<err_msg>\n"
  *
+ * USP Service (usp_service_*)
+ * ---------------------------
+ * An application that publishes its own data model is a USP Service: it
+ * connects to the broker's *controller* socket, registers the roots of its
+ * model, and answers the requests the broker routes to it.  The library does
+ * the protocol; the application describes its schema (objects, parameters,
+ * commands, events) and supplies callbacks that own the values.  The text
+ * formats of the callbacks use the same lines and escaping as above.
+ *
  * Subscription notification type constants
  * -----------------------------------------
  *   USP_SUBSCRIPTION_VALUE_CHANGE    – notify when a parameter changes
@@ -213,6 +222,29 @@
 #define USP_SUBSCRIPTION_VALUE_CHANGE    0
 #define USP_SUBSCRIPTION_OBJECT_CREATION 1
 #define USP_SUBSCRIPTION_OBJECT_DELETION 2
+
+/* ── Data model description constants (USP Service) ──────────────────────── */
+
+#define USP_OBJ_ACCESS_READ_ONLY    0
+#define USP_OBJ_ACCESS_ADD_DELETE   1
+#define USP_OBJ_ACCESS_ADD_ONLY     2
+#define USP_OBJ_ACCESS_DELETE_ONLY  3
+
+#define USP_PARAM_ACCESS_READ_ONLY  0
+#define USP_PARAM_ACCESS_READ_WRITE 1
+#define USP_PARAM_ACCESS_WRITE_ONLY 2
+
+#define USP_PARAM_TYPE_UNKNOWN       0
+#define USP_PARAM_TYPE_BASE64        1
+#define USP_PARAM_TYPE_BOOLEAN       2
+#define USP_PARAM_TYPE_DATE_TIME     3
+#define USP_PARAM_TYPE_DECIMAL       4
+#define USP_PARAM_TYPE_HEX_BINARY    5
+#define USP_PARAM_TYPE_INT           6
+#define USP_PARAM_TYPE_LONG          7
+#define USP_PARAM_TYPE_STRING        8
+#define USP_PARAM_TYPE_UNSIGNED_INT  9
+#define USP_PARAM_TYPE_UNSIGNED_LONG 10
 
 /* ── Opaque handle type ───────────────────────────────────────────────────── */
 
@@ -678,6 +710,163 @@ int usp_controller_last_error(
     const struct UspControllerHandle *handle,
     char   *out_error,
     size_t  out_error_len);
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * USP Service API
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+/*
+ * Opaque handle representing a USP Service (an application publishing a data
+ * model). Created by usp_service_new(), destroyed by usp_service_free().
+ * Must not be used concurrently from multiple threads.
+ */
+typedef struct UspServiceHandle UspServiceHandle;
+
+/* An error a callback reports to the broker: a TR-369 error code and text. */
+typedef struct UspServiceError {
+    uint32_t code;
+    char     msg[256];
+} UspServiceError;
+
+/*
+ * Callbacks that own the values of the published data model.
+ *
+ * Invocation context: the service's worker thread. A callback MUST be
+ * thread-safe and MUST NOT call any usp_service_* function. Every path is an
+ * instantiated path ("Device.X.Item.1."). A NULL callback makes the
+ * corresponding request fail with USP error 7001.
+ *
+ *   get        – write "PARAM\t<name>\t<value>\n" lines for obj_path into out.
+ *                Return USP_OK, or USP_ERR_NOT_FOUND if the object does not exist.
+ *   instances  – write "INSTANCE\t<path>\n" and "KEY\t<path>\t<name>\t<value>\n"
+ *                lines for the instances of table_path ("Device.X.Item.").
+ *   set        – apply names/values to obj_path; write "ERROR\t<name>\t<code>\t<msg>\n"
+ *                for every parameter not applied. Return USP_OK, or
+ *                USP_ERR_NOT_FOUND if the object does not exist.
+ *   add        – create an instance of table_path; write "INSTANCE\t<path>\n" and
+ *                "KEY\t<name>\t<value>\n". Return USP_OK, or USP_ERR_USP with *err set.
+ *   del        – delete obj_path. Return USP_OK, or USP_ERR_USP with *err set.
+ *   operate    – run `command` ("Reset()") on obj_path with the input arguments;
+ *                write "OUTPUT\t<name>\t<value>\n". Return USP_OK, or USP_ERR_USP
+ *                with *err set.
+ */
+typedef struct UspServiceCallbacks {
+    void *user_data;
+    int (*get)(void *user_data, const char *obj_path, char *out, size_t out_len);
+    int (*instances)(void *user_data, const char *table_path, char *out, size_t out_len);
+    int (*set)(void *user_data, const char *obj_path,
+               const char *const *names, const char *const *values, size_t count,
+               char *out_errors, size_t out_errors_len);
+    int (*add)(void *user_data, const char *table_path,
+               const char *const *names, const char *const *values, size_t count,
+               char *out, size_t out_len, UspServiceError *err);
+    int (*del)(void *user_data, const char *obj_path, UspServiceError *err);
+    int (*operate)(void *user_data, const char *obj_path, const char *command,
+                   const char *const *names, const char *const *values, size_t count,
+                   char *out, size_t out_len, UspServiceError *err);
+} UspServiceCallbacks;
+
+/*
+ * usp_service_new
+ *
+ * Create a USP Service handle.
+ *   socket_path        – the broker's controller UDS socket
+ *                        (e.g. "/var/run/usp/broker_controller_path").
+ *   endpoint_id        – this service's endpoint ID.
+ *   broker_endpoint_id – the broker's endpoint ID, or "" to use the one it
+ *                        reports in the UDS handshake.
+ *   timeout_secs       – per-request timeout; 0 = default (10 seconds).
+ * Returns NULL on invalid arguments. The caller must usp_service_free() it.
+ */
+LIBUSP_API
+UspServiceHandle *usp_service_new(
+    const char *socket_path,
+    const char *endpoint_id,
+    const char *broker_endpoint_id,
+    uint64_t    timeout_secs);
+
+/* Stop the service if running and release the handle. NULL is a no-op. */
+LIBUSP_API
+void usp_service_free(UspServiceHandle *handle);
+
+/* Password for the broker's authenticated controller socket (see usp_controller_set_password). */
+LIBUSP_API
+int usp_service_set_password(UspServiceHandle *handle, const char *password);
+
+/*
+ * Describe the data model, before usp_service_start().
+ *   usp_service_add_object  – path is a schema path: "Device.X." for a single
+ *                             object, "Device.X.Item.{i}." for a table
+ *                             (multi_instance non-zero); access is USP_OBJ_ACCESS_*;
+ *                             unique_keys is a comma-separated list or NULL.
+ *   usp_service_add_param   – a parameter of an object added before; access is
+ *                             USP_PARAM_ACCESS_*, value_type USP_PARAM_TYPE_*.
+ *   usp_service_add_command – a command ("Reset()") with comma-separated input and
+ *                             output argument names (either may be NULL).
+ *   usp_service_add_event   – an event ("Changed!") with comma-separated argument names.
+ * Returns USP_OK, USP_ERR_NULL_POINTER, or USP_ERR_NOT_FOUND when obj_path was not added.
+ */
+LIBUSP_API
+int usp_service_add_object(UspServiceHandle *handle, const char *path, int multi_instance,
+                           int access, const char *unique_keys);
+LIBUSP_API
+int usp_service_add_param(UspServiceHandle *handle, const char *obj_path, const char *name,
+                          int access, int value_type);
+LIBUSP_API
+int usp_service_add_command(UspServiceHandle *handle, const char *obj_path, const char *name,
+                            const char *input_args, const char *output_args, int async);
+LIBUSP_API
+int usp_service_add_event(UspServiceHandle *handle, const char *obj_path, const char *name,
+                          const char *args);
+
+/* Install the callbacks (copied). */
+LIBUSP_API
+int usp_service_set_callbacks(UspServiceHandle *handle, const UspServiceCallbacks *callbacks);
+
+/*
+ * usp_service_start
+ *
+ * Connect to the broker, establish the UDS session and register `roots`
+ * (schema paths ending in '.'). out_result receives one line per root:
+ *   "REGISTERED\t<path>\n"  or  "ERROR\t<path>\t<err_code>\t<err_msg>\n"
+ * Returns USP_OK when the Register exchange completed (check the lines for
+ * per-path refusals), USP_ERR_USP when the connection or the exchange failed
+ * (see usp_service_last_error). Blocking: yes.
+ */
+LIBUSP_API
+int usp_service_start(UspServiceHandle *handle, const char *const *roots, size_t root_count,
+                      int allow_partial, char *out_result, size_t out_result_len);
+
+/* Deregister and disconnect. Safe when not started. */
+LIBUSP_API
+int usp_service_stop(UspServiceHandle *handle);
+
+/* 1 while the service is connected and serving, 0 otherwise. */
+LIBUSP_API
+int usp_service_running(const UspServiceHandle *handle);
+
+/* The broker's endpoint ID once started. */
+LIBUSP_API
+int usp_service_broker_endpoint_id(const UspServiceHandle *handle, char *out, size_t out_len);
+
+/*
+ * Notifications, sent for every enabled subscription the broker holds on
+ * this service whose NotifType and ReferenceList match. Non-blocking.
+ */
+LIBUSP_API
+int usp_service_value_changed(UspServiceHandle *handle, const char *param_path, const char *value);
+LIBUSP_API
+int usp_service_object_created(UspServiceHandle *handle, const char *obj_path,
+                               const char *const *key_names, const char *const *key_values, size_t count);
+LIBUSP_API
+int usp_service_object_deleted(UspServiceHandle *handle, const char *obj_path);
+LIBUSP_API
+int usp_service_event(UspServiceHandle *handle, const char *obj_path, const char *event_name,
+                      const char *const *names, const char *const *values, size_t count);
+
+/* The last error text on this handle. */
+LIBUSP_API
+int usp_service_last_error(const UspServiceHandle *handle, char *out_error, size_t out_error_len);
 
 #ifdef __cplusplus
 } /* extern "C" */

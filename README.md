@@ -107,7 +107,7 @@ The library is designed with long-running processes, constrained systems, asynch
 | USP OPERATE | ✅ |
 | USP SUBSCRIBE_AND_GET | ✅ |
 | USP SUBSCRIBE_MANY_AND_GET | ✅ |
-| USP REGISTER | 🚧 |
+| USP REGISTER (as a USP Service, with DEREGISTER, GET_SUPPORTED_DM, GET, GET_INSTANCES, SET, ADD, DELETE, OPERATE served and NOTIFY sent) | ✅ |
 | USP ADD | ✅ |
 | USP DELETE | ✅ |
 | USP GET_SUPPORTED_DM | ✅ |
@@ -144,7 +144,12 @@ The library is designed with long-running processes, constrained systems, asynch
 | `usp_controller_subscribe_many_and_get()` | ✅ | Create multiple subscriptions and retrieve state |
 | `usp_controller_last_error()` | ✅ | Retrieve the last human-readable error |
 | `usp_error_is_vendor_defined()` | ✅ | Test whether a USP error code is vendor-defined |
-| `usp_controller_register()` | 🚧 | Register a data model (USP Service) |
+| `usp_controller_register()` | ❌ | Registering a data model makes the app a USP Service: use `usp_service_*` |
+| `usp_service_new()` / `usp_service_free()` | ✅ | A USP Service that publishes a data model through the broker |
+| `usp_service_add_object()` / `_add_param()` / `_add_command()` / `_add_event()` | ✅ | Describe the published data model |
+| `usp_service_set_callbacks()` | ✅ | Callbacks that own the values (get, instances, set, add, delete, operate) |
+| `usp_service_start()` / `usp_service_stop()` | ✅ | Register the roots with the broker; deregister and disconnect |
+| `usp_service_value_changed()` / `_object_created()` / `_object_deleted()` / `_event()` | ✅ | Notify the broker's subscriptions |
 | `usp_controller_add()` | ✅ | Create object instance |
 | `usp_controller_delete()` | ✅ | Delete object instance |
 | `usp_controller_get_supported_dm()` | ✅ | Query supported data model |

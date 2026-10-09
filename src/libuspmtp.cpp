@@ -28,13 +28,17 @@
  */
 
 #include "client.hpp"
+#include "service.hpp"
 
 #include <cassert>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <map>
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include "libuspmtp.h"
 
@@ -299,6 +303,209 @@ notif_type_from_int(int value, int& err_out) {
         err_out = USP_ERR_INVALID_ARGUMENT;
         return usp::SubscriptionNotificationType::ValueChange;
     }
+}
+
+
+/* ── USP Service handle and callback adapters ────────────────────────────── */
+
+static constexpr size_t SERVICE_CALLBACK_BUFFER = 64 * 1024;
+
+struct UspServiceHandle {
+    usp::UspService                 service;
+    std::vector<usp::ServiceObject> objects;      /* described before the first start */
+    bool                            described{false};
+    UspServiceCallbacks             callbacks{};
+    mutable std::mutex              last_error_mutex;
+    mutable std::string             last_error;
+
+    UspServiceHandle(std::string socket_path, std::string endpoint_id, std::string broker_endpoint_id)
+        : service(std::move(socket_path), std::move(endpoint_id), std::move(broker_endpoint_id)) {}
+
+    void set_last_error(const std::string& msg) const {
+        std::lock_guard lk(last_error_mutex);
+        last_error = msg;
+    }
+
+    std::string get_last_error() const {
+        std::lock_guard lk(last_error_mutex);
+        return last_error;
+    }
+
+    usp::ServiceObject* find_object(const std::string& path) {
+        for (auto& object : objects)
+            if (object.path == path) return &object;
+        return nullptr;
+    }
+};
+
+static std::string unescape_field(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (s[i] == '\\' && i + 1 < s.size()) {
+            ++i;
+            if (s[i] == 't') out += '\t';
+            else if (s[i] == 'n') out += '\n';
+            else out += s[i];
+        } else {
+            out += s[i];
+        }
+    }
+    return out;
+}
+
+/* Split callback text into lines of tab-separated, unescaped fields. */
+static std::vector<std::vector<std::string>> parse_lines(const char* text) {
+    std::vector<std::vector<std::string>> lines;
+    std::string all = text ? text : "";
+    size_t start = 0;
+    while (start < all.size()) {
+        size_t nl = all.find('\n', start);
+        if (nl == std::string::npos) nl = all.size();
+        std::string line = all.substr(start, nl - start);
+        start = nl + 1;
+        if (line.empty()) continue;
+        std::vector<std::string> fields;
+        size_t fstart = 0;
+        for (;;) {
+            size_t tab = line.find('\t', fstart);
+            fields.push_back(unescape_field(line.substr(fstart, tab == std::string::npos ? std::string::npos : tab - fstart)));
+            if (tab == std::string::npos) break;
+            fstart = tab + 1;
+        }
+        lines.push_back(std::move(fields));
+    }
+    return lines;
+}
+
+static std::vector<std::string> split_csv(const char* text) {
+    std::vector<std::string> out;
+    if (!text) return out;
+    std::string all = text;
+    size_t start = 0;
+    while (start <= all.size()) {
+        size_t comma = all.find(',', start);
+        if (comma == std::string::npos) comma = all.size();
+        std::string item = all.substr(start, comma - start);
+        if (!item.empty()) out.push_back(item);
+        start = comma + 1;
+    }
+    return out;
+}
+
+/* Parallel C arrays for a std::map, valid while `keys`/`vals` live. */
+struct CStringPairs {
+    std::vector<const char*> keys;
+    std::vector<const char*> vals;
+    explicit CStringPairs(const std::map<std::string, std::string>& m) {
+        for (auto& [k, v] : m) {
+            keys.push_back(k.c_str());
+            vals.push_back(v.c_str());
+        }
+    }
+    const char* const* names() const { return keys.empty() ? nullptr : keys.data(); }
+    const char* const* values() const { return vals.empty() ? nullptr : vals.data(); }
+    size_t count() const { return keys.size(); }
+};
+
+static usp::UspError callback_error(const UspServiceError& err, uint32_t fallback) {
+    return usp::UspError::agent_rejected(err.code ? err.code : fallback, err.msg);
+}
+
+static usp::ServiceHandlers make_handlers(UspServiceHandle* h) {
+    usp::ServiceHandlers out;
+    const UspServiceCallbacks cb = h->callbacks;
+
+    if (cb.get) {
+        out.get = [cb](const std::string& path) -> std::optional<std::map<std::string, std::string>> {
+            std::vector<char> buf(SERVICE_CALLBACK_BUFFER, '\0');
+            if (cb.get(cb.user_data, path.c_str(), buf.data(), buf.size()) != USP_OK) return std::nullopt;
+            std::map<std::string, std::string> values;
+            for (auto& fields : parse_lines(buf.data()))
+                if (fields.size() >= 3 && fields[0] == "PARAM") values[fields[1]] = fields[2];
+            return values;
+        };
+    }
+    if (cb.instances) {
+        out.instances = [cb](const std::string& table) {
+            std::vector<usp::proto::CurrInstance> instances;
+            std::vector<char> buf(SERVICE_CALLBACK_BUFFER, '\0');
+            if (cb.instances(cb.user_data, table.c_str(), buf.data(), buf.size()) != USP_OK) return instances;
+            for (auto& fields : parse_lines(buf.data())) {
+                if (fields.size() >= 2 && fields[0] == "INSTANCE") {
+                    instances.push_back({fields[1], {}});
+                } else if (fields.size() >= 4 && fields[0] == "KEY") {
+                    for (auto& instance : instances)
+                        if (instance.instantiated_obj_path == fields[1]) instance.unique_keys[fields[2]] = fields[3];
+                }
+            }
+            return instances;
+        };
+    }
+    if (cb.set) {
+        out.set = [cb](const std::string& path, const std::map<std::string, std::string>& params)
+            -> std::optional<usp::ParamErrors> {
+            CStringPairs pairs(params);
+            std::vector<char> buf(SERVICE_CALLBACK_BUFFER, '\0');
+            if (cb.set(cb.user_data, path.c_str(), pairs.names(), pairs.values(), pairs.count(),
+                       buf.data(), buf.size()) != USP_OK) return std::nullopt;
+            usp::ParamErrors errors;
+            for (auto& fields : parse_lines(buf.data()))
+                if (fields.size() >= 4 && fields[0] == "ERROR")
+                    errors.push_back({fields[1], static_cast<uint32_t>(std::strtoul(fields[2].c_str(), nullptr, 10)), fields[3]});
+            return errors;
+        };
+    }
+    if (cb.add) {
+        out.add = [cb](const std::string& table, const std::map<std::string, std::string>& params)
+            -> usp::UspResult<usp::AddResponse> {
+            CStringPairs pairs(params);
+            std::vector<char> buf(SERVICE_CALLBACK_BUFFER, '\0');
+            UspServiceError err{};
+            if (cb.add(cb.user_data, table.c_str(), pairs.names(), pairs.values(), pairs.count(),
+                       buf.data(), buf.size(), &err) != USP_OK) return callback_error(err, 7017);
+            usp::AddResponse resp;
+            for (auto& fields : parse_lines(buf.data())) {
+                if (fields.size() >= 2 && fields[0] == "INSTANCE") resp.instantiated_path = fields[1];
+                else if (fields.size() >= 3 && fields[0] == "KEY") resp.unique_keys[fields[1]] = fields[2];
+            }
+            if (resp.instantiated_path.empty())
+                return usp::UspError::agent_rejected(7017, "add callback returned no INSTANCE line");
+            return resp;
+        };
+    }
+    if (cb.del) {
+        out.del = [cb](const std::string& path) -> std::optional<usp::UspError> {
+            UspServiceError err{};
+            if (cb.del(cb.user_data, path.c_str(), &err) != USP_OK) return callback_error(err, 7024);
+            return std::nullopt;
+        };
+    }
+    if (cb.operate) {
+        out.operate = [cb](const std::string& path, const std::string& command,
+                           const std::map<std::string, std::string>& input)
+            -> usp::UspResult<std::map<std::string, std::string>> {
+            CStringPairs pairs(input);
+            std::vector<char> buf(SERVICE_CALLBACK_BUFFER, '\0');
+            UspServiceError err{};
+            if (cb.operate(cb.user_data, path.c_str(), command.c_str(), pairs.names(), pairs.values(), pairs.count(),
+                           buf.data(), buf.size(), &err) != USP_OK) return callback_error(err, 7022);
+            std::map<std::string, std::string> output;
+            for (auto& fields : parse_lines(buf.data()))
+                if (fields.size() >= 3 && fields[0] == "OUTPUT") output[fields[1]] = fields[2];
+            return output;
+        };
+    }
+    return out;
+}
+
+static std::string format_register_results(const std::vector<usp::RegisterResult>& results) {
+    std::string out;
+    for (const auto& r : results) {
+        if (r.ok) out += "REGISTERED\t" + escape_field(r.path) + "\n";
+        else out += "ERROR\t" + escape_field(r.path) + "\t" + std::to_string(r.err_code) + "\t" + escape_field(r.err_msg) + "\n";
+    }
+    return out;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -769,6 +976,217 @@ int usp_controller_last_error(const UspControllerHandle* handle,
         if (!handle) return USP_ERR_NULL_POINTER;
         auto msg = handle->get_last_error();
         return write_c_string(msg, out_error, out_error_len);
+    });
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * USP Service API
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+LIBUSP_API
+UspServiceHandle* usp_service_new(const char* socket_path,
+                                  const char* endpoint_id,
+                                  const char* broker_endpoint_id,
+                                  uint64_t    timeout_secs) {
+    try {
+        if (!socket_path || !endpoint_id || !broker_endpoint_id)
+            return nullptr;
+
+        auto* handle = new UspServiceHandle(socket_path, endpoint_id, broker_endpoint_id);
+        if (timeout_secs > 0)
+            handle->service.set_timeout(std::chrono::seconds(timeout_secs));
+        return handle;
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+LIBUSP_API
+void usp_service_free(UspServiceHandle* handle) {
+    delete handle;
+}
+
+LIBUSP_API
+int usp_service_set_password(UspServiceHandle* handle, const char* password) {
+    return with_panic_boundary([&] {
+        if (!handle || !password) return USP_ERR_NULL_POINTER;
+        handle->service.set_password(password);
+        return USP_OK;
+    });
+}
+
+LIBUSP_API
+int usp_service_add_object(UspServiceHandle* handle, const char* path, int multi_instance,
+                           int access, const char* unique_keys) {
+    return with_panic_boundary([&] {
+        if (!handle || !path) return USP_ERR_NULL_POINTER;
+        if (access < USP_OBJ_ACCESS_READ_ONLY || access > USP_OBJ_ACCESS_DELETE_ONLY) return USP_ERR_INVALID_ARGUMENT;
+        usp::ServiceObject object;
+        object.path           = path;
+        object.multi_instance = multi_instance != 0;
+        object.access         = static_cast<usp::proto::ObjAccessType>(access);
+        object.unique_keys    = split_csv(unique_keys);
+        handle->objects.push_back(std::move(object));
+        return USP_OK;
+    });
+}
+
+LIBUSP_API
+int usp_service_add_param(UspServiceHandle* handle, const char* obj_path, const char* name,
+                          int access, int value_type) {
+    return with_panic_boundary([&] {
+        if (!handle || !obj_path || !name) return USP_ERR_NULL_POINTER;
+        if (access < USP_PARAM_ACCESS_READ_ONLY || access > USP_PARAM_ACCESS_WRITE_ONLY) return USP_ERR_INVALID_ARGUMENT;
+        if (value_type < USP_PARAM_TYPE_UNKNOWN || value_type > USP_PARAM_TYPE_UNSIGNED_LONG) return USP_ERR_INVALID_ARGUMENT;
+        auto* object = handle->find_object(obj_path);
+        if (!object) return USP_ERR_NOT_FOUND;
+        object->params.push_back({name, static_cast<usp::proto::ParamAccessType>(access),
+                                  static_cast<usp::proto::ParamValueType>(value_type)});
+        return USP_OK;
+    });
+}
+
+LIBUSP_API
+int usp_service_add_command(UspServiceHandle* handle, const char* obj_path, const char* name,
+                            const char* input_args, const char* output_args, int async) {
+    return with_panic_boundary([&] {
+        if (!handle || !obj_path || !name) return USP_ERR_NULL_POINTER;
+        auto* object = handle->find_object(obj_path);
+        if (!object) return USP_ERR_NOT_FOUND;
+        object->commands.push_back({name, split_csv(input_args), split_csv(output_args), async != 0});
+        return USP_OK;
+    });
+}
+
+LIBUSP_API
+int usp_service_add_event(UspServiceHandle* handle, const char* obj_path, const char* name,
+                          const char* args) {
+    return with_panic_boundary([&] {
+        if (!handle || !obj_path || !name) return USP_ERR_NULL_POINTER;
+        auto* object = handle->find_object(obj_path);
+        if (!object) return USP_ERR_NOT_FOUND;
+        object->events.push_back({name, split_csv(args)});
+        return USP_OK;
+    });
+}
+
+LIBUSP_API
+int usp_service_set_callbacks(UspServiceHandle* handle, const UspServiceCallbacks* callbacks) {
+    return with_panic_boundary([&] {
+        if (!handle || !callbacks) return USP_ERR_NULL_POINTER;
+        handle->callbacks = *callbacks;
+        return USP_OK;
+    });
+}
+
+LIBUSP_API
+int usp_service_start(UspServiceHandle* handle, const char* const* roots, size_t root_count,
+                      int allow_partial, char* out_result, size_t out_result_len) {
+    return with_panic_boundary([&] {
+        if (!handle) return USP_ERR_NULL_POINTER;
+        std::vector<std::string> root_vec;
+        if (int rc = cstr_array_to_vec(roots, root_count, root_vec); rc != USP_OK) return rc;
+        if (root_vec.empty()) return USP_ERR_INVALID_ARGUMENT;
+
+        if (!handle->described) {
+            for (const auto& object : handle->objects)
+                handle->service.add_object(object);
+            handle->described = true;
+        }
+        handle->service.set_handlers(make_handlers(handle));
+
+        auto result = handle->service.start(root_vec, allow_partial != 0);
+
+        if (auto* results = std::get_if<std::vector<usp::RegisterResult>>(&result)) {
+            std::string encoded = format_register_results(*results);
+            if (int rc = write_optional_c_string(encoded, out_result, out_result_len); rc != USP_OK) {
+                handle->set_last_error("output buffer too small or invalid");
+                return rc;
+            }
+            return USP_OK;
+        }
+
+        auto& err = std::get<usp::UspError>(result);
+        handle->set_last_error(err.to_string());
+        return USP_ERR_USP;
+    });
+}
+
+LIBUSP_API
+int usp_service_stop(UspServiceHandle* handle) {
+    return with_panic_boundary([&] {
+        if (!handle) return USP_ERR_NULL_POINTER;
+        handle->service.stop();
+        return USP_OK;
+    });
+}
+
+LIBUSP_API
+int usp_service_running(const UspServiceHandle* handle) {
+    try {
+        return handle && handle->service.running() ? 1 : 0;
+    } catch (...) {
+        return 0;
+    }
+}
+
+LIBUSP_API
+int usp_service_broker_endpoint_id(const UspServiceHandle* handle, char* out, size_t out_len) {
+    return with_panic_boundary([&] {
+        if (!handle) return USP_ERR_NULL_POINTER;
+        return write_c_string(handle->service.broker_endpoint_id(), out, out_len);
+    });
+}
+
+LIBUSP_API
+int usp_service_value_changed(UspServiceHandle* handle, const char* param_path, const char* value) {
+    return with_panic_boundary([&] {
+        if (!handle || !param_path || !value) return USP_ERR_NULL_POINTER;
+        handle->service.value_changed(param_path, value);
+        return USP_OK;
+    });
+}
+
+LIBUSP_API
+int usp_service_object_created(UspServiceHandle* handle, const char* obj_path,
+                               const char* const* key_names, const char* const* key_values, size_t count) {
+    return with_panic_boundary([&] {
+        if (!handle || !obj_path) return USP_ERR_NULL_POINTER;
+        std::vector<std::pair<std::string, std::string>> pairs;
+        if (int rc = cstr_pairs_to_vec(key_names, key_values, count, pairs); rc != USP_OK) return rc;
+        std::map<std::string, std::string> keys(pairs.begin(), pairs.end());
+        handle->service.object_created(obj_path, keys);
+        return USP_OK;
+    });
+}
+
+LIBUSP_API
+int usp_service_object_deleted(UspServiceHandle* handle, const char* obj_path) {
+    return with_panic_boundary([&] {
+        if (!handle || !obj_path) return USP_ERR_NULL_POINTER;
+        handle->service.object_deleted(obj_path);
+        return USP_OK;
+    });
+}
+
+LIBUSP_API
+int usp_service_event(UspServiceHandle* handle, const char* obj_path, const char* event_name,
+                      const char* const* names, const char* const* values, size_t count) {
+    return with_panic_boundary([&] {
+        if (!handle || !obj_path || !event_name) return USP_ERR_NULL_POINTER;
+        std::vector<std::pair<std::string, std::string>> pairs;
+        if (int rc = cstr_pairs_to_vec(names, values, count, pairs); rc != USP_OK) return rc;
+        std::map<std::string, std::string> params(pairs.begin(), pairs.end());
+        handle->service.event(obj_path, event_name, params);
+        return USP_OK;
+    });
+}
+
+LIBUSP_API
+int usp_service_last_error(const UspServiceHandle* handle, char* out_error, size_t out_error_len) {
+    return with_panic_boundary([&] {
+        if (!handle) return USP_ERR_NULL_POINTER;
+        return write_c_string(handle->get_last_error(), out_error, out_error_len);
     });
 }
 

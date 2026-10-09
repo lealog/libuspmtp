@@ -19,6 +19,8 @@
 #include "service.hpp"
 #include "usp_proto.hpp"
 
+#include "libuspmtp.h"
+
 #include <cstdio>
 #include <cstring>
 #include <future>
@@ -830,6 +832,340 @@ static void test_destroy_while_connected() {
     ::unlink(sock_path.c_str());
 }
 
+
+/* ── The same application through the C API, with C callbacks ───────────── */
+
+struct CStore {
+    std::mutex mutex;
+    std::map<std::string, std::map<std::string, std::string>> items = {
+        {"Device.TestApp.Item.1.", {{"Name", "a"}, {"Count", "1"}}},
+        {"Device.TestApp.Item.2.", {{"Name", "b"}, {"Count", "2"}}},
+    };
+    int next_instance = 3;
+    std::vector<std::string> operated;
+};
+
+static int write_text(char* out, size_t len, const std::string& text) {
+    if (text.size() + 1 > len) return USP_ERR_BUFFER_TOO_SMALL;
+    std::memcpy(out, text.data(), text.size() + 1);
+    return USP_OK;
+}
+
+static int c_get(void* ud, const char* path, char* out, size_t len) {
+    auto* s = static_cast<CStore*>(ud);
+    std::lock_guard lk(s->mutex);
+    if (std::string(path) == "Device.TestApp.") return write_text(out, len, "PARAM\tVersion\t1.0\nPARAM\tEnable\ttrue\n");
+    auto it = s->items.find(path);
+    if (it == s->items.end()) return USP_ERR_NOT_FOUND;
+    std::string text;
+    for (auto& [k, v] : it->second) text += "PARAM\t" + k + "\t" + v + "\n";
+    return write_text(out, len, text);
+}
+
+static int c_instances(void* ud, const char* table, char* out, size_t len) {
+    auto* s = static_cast<CStore*>(ud);
+    std::lock_guard lk(s->mutex);
+    if (std::string(table) != "Device.TestApp.Item.") return write_text(out, len, "");
+    std::string text;
+    for (auto& [path, values] : s->items)
+        text += "INSTANCE\t" + path + "\nKEY\t" + path + "\tName\t" + values.at("Name") + "\n";
+    return write_text(out, len, text);
+}
+
+static int c_set(void* ud, const char* path, const char* const* names, const char* const* values, size_t n,
+                 char* out, size_t len) {
+    auto* s = static_cast<CStore*>(ud);
+    std::lock_guard lk(s->mutex);
+    auto it = s->items.find(path);
+    if (it == s->items.end()) return USP_ERR_NOT_FOUND;
+    std::string errors;
+    for (size_t i = 0; i < n; ++i) {
+        if (std::string(names[i]) == "Name") it->second["Name"] = values[i];
+        else errors += std::string("ERROR\t") + names[i] + "\t7013\tNon-writable parameter\n";
+    }
+    return write_text(out, len, errors);
+}
+
+static int c_add(void* ud, const char* table, const char* const* names, const char* const* values, size_t n,
+                 char* out, size_t len, UspServiceError* err) {
+    auto* s = static_cast<CStore*>(ud);
+    std::lock_guard lk(s->mutex);
+    if (std::string(table) != "Device.TestApp.Item.") {
+        err->code = 7026;
+        std::snprintf(err->msg, sizeof err->msg, "Invalid path");
+        return USP_ERR_USP;
+    }
+    std::string path = std::string(table) + std::to_string(s->next_instance++) + ".";
+    std::map<std::string, std::string> item = {{"Name", ""}, {"Count", "0"}};
+    for (size_t i = 0; i < n; ++i) if (std::string(names[i]) == "Name") item["Name"] = values[i];
+    s->items[path] = item;
+    return write_text(out, len, "INSTANCE\t" + path + "\nKEY\tName\t" + item["Name"] + "\n");
+}
+
+static int c_del(void* ud, const char* path, UspServiceError* err) {
+    auto* s = static_cast<CStore*>(ud);
+    std::lock_guard lk(s->mutex);
+    if (s->items.erase(path) == 0) {
+        err->code = 7016;
+        std::snprintf(err->msg, sizeof err->msg, "Object does not exist");
+        return USP_ERR_USP;
+    }
+    return USP_OK;
+}
+
+static int c_operate(void* ud, const char* path, const char* command, const char* const* names,
+                     const char* const*, size_t n, char* out, size_t len, UspServiceError* err) {
+    auto* s = static_cast<CStore*>(ud);
+    std::lock_guard lk(s->mutex);
+    s->operated.push_back(std::string(path) + command);
+    if (std::string(command) != "Reset()") {
+        err->code = 7022;
+        std::snprintf(err->msg, sizeof err->msg, "Command failure");
+        return USP_ERR_USP;
+    }
+    bool hard = false;
+    for (size_t i = 0; i < n; ++i) if (std::string(names[i]) == "Hard") hard = true;
+    return write_text(out, len, std::string("OUTPUT\tStatus\t") + (hard ? "HardDone" : "Done") + "\n");
+}
+
+static void test_c_api_guards() {
+    std::puts("test_c_api_guards");
+
+    CHECK(usp_service_new(nullptr, "proto::svc", "", 1) == nullptr);
+    CHECK(usp_service_new("/tmp/x.sock", nullptr, "", 1) == nullptr);
+    CHECK_EQ(usp_service_running(nullptr), 0);
+    char buf[64];
+    CHECK_EQ(usp_service_last_error(nullptr, buf, sizeof buf), USP_ERR_NULL_POINTER);
+    CHECK_EQ(usp_service_stop(nullptr), USP_ERR_NULL_POINTER);
+
+    UspServiceHandle* h = usp_service_new("/nonexistent/broker.sock", "proto::svc", "", 2);
+    CHECK(h != nullptr);
+    if (!h) return;
+    CHECK_EQ(usp_service_add_param(h, "Device.Missing.", "X", USP_PARAM_ACCESS_READ_ONLY, USP_PARAM_TYPE_STRING), USP_ERR_NOT_FOUND);
+    CHECK_EQ(usp_service_add_object(h, "Device.TestApp.", 0, 99, nullptr), USP_ERR_INVALID_ARGUMENT);
+    CHECK_EQ(usp_service_add_object(h, "Device.TestApp.", 0, USP_OBJ_ACCESS_READ_ONLY, nullptr), USP_OK);
+    CHECK_EQ(usp_service_add_param(h, "Device.TestApp.", "X", 7, USP_PARAM_TYPE_STRING), USP_ERR_INVALID_ARGUMENT);
+    CHECK_EQ(usp_service_add_command(h, "Device.Missing.", "Reset()", nullptr, nullptr, 0), USP_ERR_NOT_FOUND);
+    CHECK_EQ(usp_service_add_event(h, "Device.Missing.", "Changed!", nullptr), USP_ERR_NOT_FOUND);
+    CHECK_EQ(usp_service_set_callbacks(h, nullptr), USP_ERR_NULL_POINTER);
+    CHECK_EQ(usp_service_start(h, nullptr, 1, 0, buf, sizeof buf), USP_ERR_NULL_POINTER);
+    CHECK_EQ(usp_service_start(h, nullptr, 0, 0, buf, sizeof buf), USP_ERR_INVALID_ARGUMENT);
+    const char* roots[] = {"Device.TestApp."};
+    CHECK_EQ(usp_service_start(h, roots, 1, 0, buf, sizeof buf), USP_ERR_USP);
+    char err[256] = {0};
+    usp_service_last_error(h, err, sizeof err);
+    CHECK(std::string(err).find("connection failed") != std::string::npos);
+    CHECK_EQ(usp_service_running(h), 0);
+    CHECK_EQ(usp_service_value_changed(h, nullptr, "x"), USP_ERR_NULL_POINTER);
+    CHECK_EQ(usp_service_value_changed(h, "Device.TestApp.X", "x"), USP_OK);   /* not running: nothing to send */
+    usp_service_free(h);
+    usp_service_free(nullptr);
+}
+
+static void test_c_api_exchange() {
+    std::puts("test_c_api_exchange");
+
+    std::string sock_path = make_tmp_socket_path();
+    int srv_fd = listen_unix(sock_path);
+    if (srv_fd < 0) { std::puts("  SKIP: cannot bind/listen"); return; }
+
+    struct Seen { std::optional<proto::Msg> gsdm, get_obj, set, add, del, operate, sub_add, notify, dereg; } seen;
+    std::promise<void> subscribed, notified;
+    auto subscribed_f = subscribed.get_future();
+    auto notified_f = notified.get_future();
+
+    std::thread broker([&]() {
+        int fd = broker_accept(srv_fd);
+        if (fd < 0) { subscribed.set_value(); notified.set_value(); return; }
+        auto reg = read_msg(fd);
+        if (reg && reg->header) {
+            proto::RegisterResp resp;
+            proto::RegisteredPathResult ok;
+            ok.requested_path = "Device.TestApp.";
+            ok.oper_status = proto::RegisterOperationStatus{proto::RegisterOperationSuccess{"Device.TestApp."}};
+            resp.registered_path_results = {ok};
+            send_msg(fd, response_msg(reg->header->msg_id, resp));
+        }
+        proto::GetSupportedDM gsdm;
+        gsdm.obj_paths = {"Device.TestApp."};
+        gsdm.return_commands = gsdm.return_events = gsdm.return_params = gsdm.return_unique_key_sets = true;
+        send_msg(fd, request_msg("c1", gsdm));
+        seen.gsdm = read_msg(fd);
+
+        proto::Get get_obj;
+        get_obj.param_paths = {"Device.TestApp."};
+        send_msg(fd, request_msg("c2", get_obj));
+        seen.get_obj = read_msg(fd);
+
+        proto::Set set;
+        proto::UpdateObject update;
+        update.obj_path = "Device.TestApp.Item.1.";
+        update.param_settings = {{"Name", "renamed", true}, {"Count", "9", false}};
+        set.update_objs = {update};
+        send_msg(fd, request_msg("c3", set));
+        seen.set = read_msg(fd);
+
+        proto::Add add;
+        proto::CreateObject create;
+        create.obj_path = "Device.TestApp.Item.";
+        create.param_settings = {{"Name", "new", true}};
+        add.create_objs = {create};
+        send_msg(fd, request_msg("c4", add));
+        seen.add = read_msg(fd);
+
+        proto::Delete del;
+        del.obj_paths = {"Device.TestApp.Item.2."};
+        send_msg(fd, request_msg("c5", del));
+        seen.del = read_msg(fd);
+
+        proto::Operate op;
+        op.command = "Device.TestApp.Reset()";
+        op.send_resp = true;
+        op.input_args = {{"Hard", "true"}};
+        send_msg(fd, request_msg("c6", op));
+        seen.operate = read_msg(fd);
+
+        proto::Add sub_add;
+        proto::CreateObject sub;
+        sub.obj_path = "Device.LocalAgent.Subscription.";
+        sub.param_settings = {{"ID", "sub-c", true}, {"NotifType", "ObjectCreation", true},
+                              {"ReferenceList", "Device.TestApp.Item.", true}};
+        sub_add.create_objs = {sub};
+        send_msg(fd, request_msg("c7", sub_add));
+        seen.sub_add = read_msg(fd);
+        subscribed.set_value();
+
+        seen.notify = read_msg(fd);
+        notified.set_value();
+
+        seen.dereg = read_msg(fd);
+        if (seen.dereg && seen.dereg->header) {
+            proto::DeregisterResp resp;
+            proto::DeregisteredPathResult ok;
+            ok.requested_path = "Device.TestApp.";
+            ok.oper_status = proto::DeregisterOperationStatus{proto::DeregisterOperationSuccess{{"Device.TestApp."}}};
+            resp.deregistered_path_results = {ok};
+            send_msg(fd, response_msg(seen.dereg->header->msg_id, resp));
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        ::close(fd);
+    });
+
+    CStore store;
+    UspServiceHandle* h = usp_service_new(sock_path.c_str(), "proto::svc", "", 5);
+    CHECK(h != nullptr);
+    if (h) {
+        CHECK_EQ(usp_service_add_object(h, "Device.TestApp.", 0, USP_OBJ_ACCESS_READ_ONLY, nullptr), USP_OK);
+        CHECK_EQ(usp_service_add_param(h, "Device.TestApp.", "Version", USP_PARAM_ACCESS_READ_ONLY, USP_PARAM_TYPE_STRING), USP_OK);
+        CHECK_EQ(usp_service_add_param(h, "Device.TestApp.", "Enable", USP_PARAM_ACCESS_READ_WRITE, USP_PARAM_TYPE_BOOLEAN), USP_OK);
+        CHECK_EQ(usp_service_add_command(h, "Device.TestApp.", "Reset()", "Hard", "Status", 0), USP_OK);
+        CHECK_EQ(usp_service_add_event(h, "Device.TestApp.", "Changed!", "Reason"), USP_OK);
+        CHECK_EQ(usp_service_add_object(h, "Device.TestApp.Item.{i}.", 1, USP_OBJ_ACCESS_ADD_DELETE, "Name"), USP_OK);
+        CHECK_EQ(usp_service_add_param(h, "Device.TestApp.Item.{i}.", "Name", USP_PARAM_ACCESS_READ_WRITE, USP_PARAM_TYPE_STRING), USP_OK);
+        CHECK_EQ(usp_service_add_param(h, "Device.TestApp.Item.{i}.", "Count", USP_PARAM_ACCESS_READ_ONLY, USP_PARAM_TYPE_UNSIGNED_INT), USP_OK);
+
+        UspServiceCallbacks cb{};
+        cb.user_data = &store;
+        cb.get = c_get; cb.instances = c_instances; cb.set = c_set; cb.add = c_add; cb.del = c_del; cb.operate = c_operate;
+        CHECK_EQ(usp_service_set_callbacks(h, &cb), USP_OK);
+
+        char result[256] = {0};
+        const char* roots[] = {"Device.TestApp."};
+        CHECK_EQ(usp_service_start(h, roots, 1, 0, result, sizeof result), USP_OK);
+        CHECK_EQ(std::string(result), "REGISTERED\tDevice.TestApp.\n");
+        CHECK_EQ(usp_service_running(h), 1);
+        char broker_id[64] = {0};
+        CHECK_EQ(usp_service_broker_endpoint_id(h, broker_id, sizeof broker_id), USP_OK);
+        CHECK_EQ(std::string(broker_id), "proto::broker");
+
+        CHECK(subscribed_f.wait_for(std::chrono::seconds(10)) == std::future_status::ready);
+        const char* key_names[] = {"Name"};
+        const char* key_values[] = {"new"};
+        CHECK_EQ(usp_service_object_created(h, "Device.TestApp.Item.3.", key_names, key_values, 1), USP_OK);
+        CHECK(notified_f.wait_for(std::chrono::seconds(10)) == std::future_status::ready);
+
+        CHECK_EQ(usp_service_stop(h), USP_OK);
+        CHECK_EQ(usp_service_running(h), 0);
+        usp_service_free(h);
+    }
+    broker.join();
+    ::close(srv_fd);
+    ::unlink(sock_path.c_str());
+
+    auto* gsdm = response_of<proto::GetSupportedDMResp>(seen.gsdm);
+    CHECK(gsdm != nullptr);
+    if (gsdm && gsdm->req_obj_results.size() == 1 && gsdm->req_obj_results[0].supported_objs.size() == 2) {
+        const auto& objs = gsdm->req_obj_results[0].supported_objs;
+        CHECK(objs[0].supported_params.size() == 2 && objs[0].supported_params[1].value_type == proto::ParamValueType::Boolean);
+        CHECK(objs[0].supported_commands.size() == 1 && objs[0].supported_commands[0].input_arg_names == std::vector<std::string>{"Hard"});
+        CHECK(objs[0].supported_events.size() == 1);
+        CHECK(objs[1].is_multi_instance && objs[1].unique_key_sets.size() == 1);
+    } else {
+        CHECK(false);
+    }
+    auto* get = response_of<proto::GetResp>(seen.get_obj);
+    CHECK(get != nullptr);
+    if (get && get->req_path_results.size() == 1) {
+        std::map<std::string, std::map<std::string, std::string>> by_path;
+        for (auto& r : get->req_path_results[0].resolved_path_results) by_path[r.resolved_path] = r.result_params;
+        CHECK_EQ(by_path.size(), 3u);
+        CHECK_EQ(by_path["Device.TestApp."]["Version"], "1.0");
+        CHECK_EQ(by_path["Device.TestApp.Item.2."]["Name"], "b");
+    }
+    auto* set = response_of<proto::SetResp>(seen.set);
+    CHECK(set != nullptr);
+    if (set && set->updated_obj_results.size() == 1 && set->updated_obj_results[0].oper_status) {
+        auto* ok = std::get_if<proto::OperationSuccess>(&set->updated_obj_results[0].oper_status->oper_status);
+        CHECK(ok != nullptr && ok->updated_inst_results.size() == 1);
+        if (ok && ok->updated_inst_results.size() == 1) {
+            CHECK_EQ(ok->updated_inst_results[0].updated_params.at("Name"), "renamed");
+            CHECK(ok->updated_inst_results[0].param_errs.size() == 1 && ok->updated_inst_results[0].param_errs[0].err_code == 7013);
+        }
+    }
+    auto* add = response_of<proto::AddResp>(seen.add);
+    CHECK(add != nullptr);
+    if (add && add->created_obj_results.size() == 1 && add->created_obj_results[0].oper_status) {
+        auto* ok = std::get_if<proto::AddOperationSuccess>(&add->created_obj_results[0].oper_status->oper_status);
+        CHECK(ok != nullptr);
+        if (ok) {
+            CHECK_EQ(ok->instantiated_path, "Device.TestApp.Item.3.");
+            CHECK_EQ(ok->unique_keys.at("Name"), "new");
+        }
+    }
+    auto* del = response_of<proto::DeleteResp>(seen.del);
+    CHECK(del != nullptr);
+    if (del && del->deleted_obj_results.size() == 1 && del->deleted_obj_results[0].oper_status)
+        CHECK(std::get_if<proto::DeleteOperationSuccess>(&del->deleted_obj_results[0].oper_status->oper_status) != nullptr);
+    auto* op = response_of<proto::OperateResp>(seen.operate);
+    CHECK(op != nullptr);
+    if (op && op->operation_results.size() == 1) {
+        auto* args = std::get_if<proto::OutputArgs>(&op->operation_results[0].operation_resp);
+        CHECK(args != nullptr);
+        if (args) CHECK_EQ(args->output_args.at("Status"), "HardDone");
+    }
+    {
+        std::lock_guard lk(store.mutex);
+        CHECK_EQ(store.items["Device.TestApp.Item.1."]["Name"], "renamed");
+        CHECK(store.items.count("Device.TestApp.Item.2.") == 0);
+        CHECK(store.items.count("Device.TestApp.Item.3.") == 1);
+        CHECK_EQ(store.operated, std::vector<std::string>{"Device.TestApp.Reset()"});
+    }
+    auto* req = seen.notify && seen.notify->body ? std::get_if<proto::Request>(&seen.notify->body->msg_body) : nullptr;
+    auto* notify = req ? std::get_if<proto::Notify>(&req->req_type) : nullptr;
+    CHECK(notify != nullptr);
+    if (notify) {
+        CHECK_EQ(notify->subscription_id, "sub-c");
+        auto* oc = std::get_if<proto::ObjectCreation>(&notify->notification);
+        CHECK(oc != nullptr);
+        if (oc) {
+            CHECK_EQ(oc->obj_path, "Device.TestApp.Item.3.");
+            CHECK_EQ(oc->unique_keys.at("Name"), "new");
+        }
+    }
+    auto* dreq = seen.dereg && seen.dereg->body ? std::get_if<proto::Request>(&seen.dereg->body->msg_body) : nullptr;
+    CHECK(dreq != nullptr && std::get_if<proto::Deregister>(&dreq->req_type) != nullptr);
+}
+
 int main() {
     ::signal(SIGPIPE, SIG_IGN);
 
@@ -838,6 +1174,8 @@ int main() {
     test_full_exchange();
     test_error_replies();
     test_destroy_while_connected();
+    test_c_api_guards();
+    test_c_api_exchange();
 
     std::printf("\n%s: %d passed, %d failed\n", (g_fail == 0) ? "PASS" : "FAIL", g_pass, g_fail);
     return g_fail != 0 ? 1 : 0;
