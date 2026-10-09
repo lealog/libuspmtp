@@ -249,10 +249,10 @@ int usp_controller_get(UspControllerHandle* handle,
     });
 }
 
-LIBUSP_API
-int usp_controller_get_many(UspControllerHandle* handle,
+static int get_many_impl(UspControllerHandle* handle,
                              const char* const*   paths,
                              size_t               path_count,
+                             uint32_t             max_depth,
                              char*                out_result,
                              size_t               out_result_len) {
     return with_panic_boundary([&] {
@@ -262,7 +262,7 @@ int usp_controller_get_many(UspControllerHandle* handle,
         if (int rc = cstr_array_to_vec(paths, path_count, path_vec); rc != USP_OK) return rc;
         if (path_vec.empty()) return USP_ERR_INVALID_ARGUMENT;
 
-        auto result = handle->controller.get_many(path_vec);
+        auto result = handle->controller.get_many(path_vec, max_depth);
 
         if (auto* resp = std::get_if<usp::GetResponse>(&result)) {
             std::string encoded = format_get_response(*resp);
@@ -278,6 +278,26 @@ int usp_controller_get_many(UspControllerHandle* handle,
         handle->set_last_error(err.to_string());
         return USP_ERR_USP;
     });
+}
+
+
+LIBUSP_API
+int usp_controller_get_many(UspControllerHandle* handle,
+                             const char* const*   paths,
+                             size_t               path_count,
+                             char*                out_result,
+                             size_t               out_result_len) {
+    return get_many_impl(handle, paths, path_count, 0, out_result, out_result_len);
+}
+
+LIBUSP_API
+int usp_controller_get_many_depth(UspControllerHandle* handle,
+                                   const char* const*   paths,
+                                   size_t               path_count,
+                                   uint32_t             max_depth,
+                                   char*                out_result,
+                                   size_t               out_result_len) {
+    return get_many_impl(handle, paths, path_count, max_depth, out_result, out_result_len);
 }
 
 LIBUSP_API

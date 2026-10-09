@@ -97,7 +97,8 @@ static std::string tlv_string(TlvView tlv) {
 std::variant<Transport, TransportError>
 Transport::connect(const std::string& socket_path,
                    std::chrono::seconds io_timeout,
-                   const std::string& endpoint_id)
+                   const std::string& endpoint_id,
+                   std::string* peer_endpoint_id)
 {
     /* Create socket. */
     int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
@@ -148,6 +149,11 @@ Transport::connect(const std::string& socket_path,
     auto hs = t.recv_handshake();
     if (auto* err = std::get_if<TransportError>(&hs))
         return *err;
+
+    if (peer_endpoint_id) {
+        const auto& peer = std::get<std::vector<uint8_t>>(hs);
+        peer_endpoint_id->assign(peer.begin(), peer.end());
+    }
 
     return t;
 }

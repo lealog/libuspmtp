@@ -132,14 +132,17 @@ public:
     /**
      * Open a UNIX domain socket connection to `socket_path`, apply
      * `io_timeout` as both the send and receive timeout, and complete the
-     * UDS MTP handshake identifying this side as `endpoint_id`.
+     * UDS MTP handshake identifying this side as `endpoint_id`. If
+     * `peer_endpoint_id` is non-null it receives the agent's endpoint ID
+     * from the handshake reply.
      *
      * Returns a ready Transport or a TransportError on failure.
      */
     static std::variant<Transport, TransportError>
     connect(const std::string& socket_path,
             std::chrono::seconds io_timeout,
-            const std::string& endpoint_id);
+            const std::string& endpoint_id,
+            std::string* peer_endpoint_id = nullptr);
 
     /* Non-copyable, movable. */
     Transport(const Transport&) = delete;

@@ -179,7 +179,8 @@ public:
      *
      * @param socket_path       Filesystem path of the OB-USPA UNIX domain socket.
      * @param app_endpoint_id   USP endpoint ID of this application (from_id).
-     * @param agent_endpoint_id USP endpoint ID of the agent (to_id).
+     * @param agent_endpoint_id USP endpoint ID of the agent (to_id). Empty means
+     *                          use the ID the agent reports in the UDS handshake.
      */
     UspController(std::string socket_path,
                   std::string app_endpoint_id,
@@ -194,7 +195,8 @@ public:
     /* ── GET ─────────────────────────────────────────────────────────── */
 
     UspResult<GetResponse> get(const std::string& path);
-    UspResult<GetResponse> get_many(const std::vector<std::string>& paths);
+    UspResult<GetResponse> get_many(const std::vector<std::string>& paths,
+                                    uint32_t max_depth = 0);
 
     /* ── SET ─────────────────────────────────────────────────────────── */
 

@@ -476,13 +476,19 @@ std::shared_ptr<UspController::SessionState> UspController::ensure_session() {
     if (*session_) return **session_;
 
     /* Connect transport with a 1-second I/O timeout (for the worker poll). */
+    std::string peer_id;
     auto transport_result = Transport::connect(
-        socket_path_, SESSION_IO_TIMEOUT, endpoint_id_);
+        socket_path_, SESSION_IO_TIMEOUT, endpoint_id_, &peer_id);
 
     if (auto* err = std::get_if<TransportError>(&transport_result))
         throw *err; /* caller converts to UspError */
 
     Transport transport = std::move(std::get<Transport>(transport_result));
+
+    /* An empty agent endpoint ID means "address whichever agent answered the
+     * handshake". */
+    if (agent_endpoint_id_.empty())
+        agent_endpoint_id_ = peer_id;
 
     /* Perform the UDS session-establishment handshake required by the
      * OB-USPA UDS MTP.  After the socket handshake completes, the agent
@@ -535,6 +541,9 @@ UspResult<proto::Record> UspController::round_trip(proto::Record record) {
         } catch (const TransportError& te) {
             return UspError::from_transport(te);
         }
+
+        if (record.to_id.empty())
+            record.to_id = agent_endpoint_id_;
 
         /* Enqueue command with a promise. */
         std::promise<UspResult<proto::Record>> promise;
@@ -757,10 +766,11 @@ UspResult<GetResponse> UspController::get(const std::string& path) {
     return get_many({path});
 }
 
-UspResult<GetResponse> UspController::get_many(const std::vector<std::string>& paths) {
+UspResult<GetResponse> UspController::get_many(const std::vector<std::string>& paths,
+                                               uint32_t max_depth) {
     proto::Get get_msg;
     get_msg.param_paths = paths;
-    get_msg.max_depth   = 0;
+    get_msg.max_depth   = max_depth;
 
     proto::Request req;
     req.req_type = std::move(get_msg);

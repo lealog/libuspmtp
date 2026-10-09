@@ -235,7 +235,8 @@ extern "C" {
  *                       in every outgoing USP Record.  Must not be NULL.
  *   agent_endpoint_id – NUL-terminated TR-369 USP endpoint ID of the agent
  *                       (e.g. "proto::api-gateway").  Sent as to_id.
- *                       Must not be NULL.
+ *                       Must not be NULL; pass "" to address whichever agent
+ *                       answers the UDS handshake.
  *   timeout_secs      – Per-request I/O timeout in seconds.  Pass 0 to use
  *                       the default (10 seconds).
  *
@@ -327,6 +328,21 @@ int usp_controller_get_many(
     struct UspControllerHandle *handle,
     const char *const          *paths,
     size_t                      path_count,
+    char                       *out_result,
+    size_t                      out_result_len);
+
+/*
+ * usp_controller_get_many_depth
+ *
+ * Like usp_controller_get_many but sets the USP Get max_depth (0 = unlimited,
+ * 1 = only the requested object's direct children).  Same response format.
+ */
+LIBUSP_API
+int usp_controller_get_many_depth(
+    struct UspControllerHandle *handle,
+    const char *const          *paths,
+    size_t                      path_count,
+    uint32_t                    max_depth,
     char                       *out_result,
     size_t                      out_result_len);
 
