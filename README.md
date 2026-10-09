@@ -294,6 +294,48 @@ int main()
 
 ---
 
+## Publishing a data model (USP Service)
+
+An application that owns part of the data model is a USP Service: it connects to the
+broker's *controller* socket, registers its roots, and answers what the broker routes to it.
+The library does the protocol; the application describes the schema and supplies callbacks
+that own the values (see `usp_service_*` in `libuspmtp.h`).
+
+```c
+#include "libuspmtp.h"
+
+static int my_get(void *ud, const char *obj_path, char *out, size_t out_len) {
+    if (strcmp(obj_path, "Device.X_EXAMPLE_App.") != 0) return USP_ERR_NOT_FOUND;
+    snprintf(out, out_len, "PARAM\tVersion\t1.0\nPARAM\tEnable\ttrue\n");
+    return USP_OK;
+}
+
+int main(void)
+{
+    UspServiceHandle *svc = usp_service_new("/var/run/usp/broker_controller_path", "proto::my-app", "", 10);
+    usp_service_add_object(svc, "Device.X_EXAMPLE_App.", 0, USP_OBJ_ACCESS_READ_ONLY, NULL);
+    usp_service_add_param(svc, "Device.X_EXAMPLE_App.", "Version", USP_PARAM_ACCESS_READ_ONLY, USP_PARAM_TYPE_STRING);
+    usp_service_add_param(svc, "Device.X_EXAMPLE_App.", "Enable", USP_PARAM_ACCESS_READ_WRITE, USP_PARAM_TYPE_BOOLEAN);
+
+    UspServiceCallbacks cb = {0};
+    cb.get = my_get;                       /* set, add, del, operate, instances are optional */
+    usp_service_set_callbacks(svc, &cb);
+
+    const char *roots[] = {"Device.X_EXAMPLE_App."};
+    char result[256];
+    if (usp_service_start(svc, roots, 1, 0, result, sizeof result) == USP_OK)
+        printf("%s", result);              /* REGISTERED\tDevice.X_EXAMPLE_App.\n */
+
+    /* ... the broker now routes Get/Set/Operate for that object to the callbacks ... */
+    usp_service_value_changed(svc, "Device.X_EXAMPLE_App.Enable", "false");   /* Notify matching subscriptions */
+
+    usp_service_free(svc);                 /* deregisters and disconnects */
+    return 0;
+}
+```
+
+A C++ program uses `usp::UspService` (`service.hpp`) with `std::function` handlers instead.
+
 ## Rust
 
 Rust consumers use the same C ABI through a small `extern "C"` declaration.
