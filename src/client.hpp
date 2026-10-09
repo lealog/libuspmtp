@@ -148,6 +148,31 @@ struct OperateResponse {
     std::map<std::string, std::string> output_args;
 };
 
+/** Response returned by add(): the instance the agent created. */
+struct AddResponse {
+    std::string                        instantiated_path;
+    std::map<std::string, std::string> unique_keys;
+    std::vector<PathError>             param_errors; /* parameters the agent did not apply */
+};
+
+/** Response returned by delete_instance(). */
+struct DeleteResponse {
+    std::vector<std::string> affected_paths;
+    std::vector<PathError>   unaffected_paths;
+};
+
+/** Response returned by get_supported_dm(). */
+struct SupportedDMResponse {
+    std::vector<proto::SupportedObjectResult> objects;
+    std::vector<PathError>                    errors;
+};
+
+/** Response returned by get_instances(). */
+struct InstancesResponse {
+    std::vector<proto::CurrInstance> instances;
+    std::vector<PathError>           errors;
+};
+
 /* ── Result type ────────────────────────────────────────────────────────── */
 
 template<typename T>
@@ -227,15 +252,31 @@ public:
         const std::vector<std::pair<std::string, SubscriptionNotificationType>>& subs,
         std::function<void()> callback);
 
+    /* ── ADD / DELETE ────────────────────────────────────────────────── */
+
+    /** Create one instance of table `obj` ("Device.X.Y.") with the given parameter names and values. */
+    UspResult<AddResponse> add(const std::string& obj,
+                               const std::vector<std::pair<std::string,std::string>>& params);
+
+    /** Delete one instance ("Device.X.Y.3."). */
+    UspResult<DeleteResponse> delete_instance(const std::string& instance);
+
+    /* ── Discovery ───────────────────────────────────────────────────── */
+
+    /** The supported data model under `obj` (parameters, commands, events and unique keys). */
+    UspResult<SupportedDMResponse> get_supported_dm(const std::string& obj,
+                                                    bool first_level_only = false);
+
+    /** The instances under `obj`, with their unique keys. */
+    UspResult<InstancesResponse> get_instances(const std::string& obj,
+                                               bool first_level_only = false);
+
+    /** The USP protocol versions the agent supports, as the agent reports them. */
+    UspResult<std::string> get_supported_protocol(const std::string& controller_versions = "1.5");
+
     /* ── Not-yet-implemented stubs ───────────────────────────────────── */
 
     UspError register_obj(const std::string& obj);
-    UspError add(const std::string& obj,
-                 const std::vector<std::pair<std::string,std::string>>& params);
-    UspError delete_instance(const std::string& instance);
-    UspError get_supported_dm(const std::string& obj);
-    UspError get_instances(const std::string& obj);
-    UspError get_supported_protocol();
 
     /* ── Session worker command/reply types (public for free-function access) */
 

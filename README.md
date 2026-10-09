@@ -108,11 +108,11 @@ The library is designed with long-running processes, constrained systems, asynch
 | USP SUBSCRIBE_AND_GET | ✅ |
 | USP SUBSCRIBE_MANY_AND_GET | ✅ |
 | USP REGISTER | 🚧 |
-| USP ADD | 🚧 |
-| USP DELETE | 🚧 |
-| USP GET_SUPPORTED_DM | 🚧 |
-| USP GET_INSTANCES | 🚧 |
-| USP GET_SUPPORTED_PROTOCOL | 🚧 |
+| USP ADD | ✅ |
+| USP DELETE | ✅ |
+| USP GET_SUPPORTED_DM | ✅ |
+| USP GET_INSTANCES | ✅ |
+| USP GET_SUPPORTED_PROTOCOL | ✅ |
 | C-compatible public API | ✅ |
 | C++20 implementation | ✅ |
 | Static library | ✅ |
@@ -134,6 +134,7 @@ The library is designed with long-running processes, constrained systems, asynch
 | `usp_controller_new()` | ✅ | Create a controller |
 | `usp_controller_free()` | ✅ | Destroy a controller and release its resources |
 | `usp_controller_set_timeout()` | ✅ | Configure operation timeout |
+| `usp_controller_set_password()` | ✅ | Password for the agent's authenticated UDS sockets |
 | `usp_controller_get()` | ✅ | Retrieve parameters |
 | `usp_controller_get_many()` | ✅ | Retrieve multiple paths |
 | `usp_controller_set()` | ✅ | Update a parameter |
@@ -143,12 +144,12 @@ The library is designed with long-running processes, constrained systems, asynch
 | `usp_controller_subscribe_many_and_get()` | ✅ | Create multiple subscriptions and retrieve state |
 | `usp_controller_last_error()` | ✅ | Retrieve the last human-readable error |
 | `usp_error_is_vendor_defined()` | ✅ | Test whether a USP error code is vendor-defined |
-| `usp_controller_register()` | 🚧 | Register controller |
-| `usp_controller_add()` | 🚧 | Create object instance |
-| `usp_controller_delete()` | 🚧 | Delete object instance |
-| `usp_controller_get_supported_dm()` | 🚧 | Query supported data model |
-| `usp_controller_get_instances()` | 🚧 | Query object instances |
-| `usp_controller_get_supported_protocol()` | 🚧 | Query supported USP protocol |
+| `usp_controller_register()` | 🚧 | Register a data model (USP Service) |
+| `usp_controller_add()` | ✅ | Create object instance |
+| `usp_controller_delete()` | ✅ | Delete object instance |
+| `usp_controller_get_supported_dm()` | ✅ | Query supported data model |
+| `usp_controller_get_instances()` | ✅ | Query object instances |
+| `usp_controller_get_supported_protocol()` | ✅ | Query supported USP protocol |
 
 APIs marked as planned currently return `USP_ERR_USP`.
 

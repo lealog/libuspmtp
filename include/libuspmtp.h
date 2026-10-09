@@ -73,6 +73,27 @@
  *   OPERATE response lines:
  *     "OUTPUT\t<key>\t<value>\n"
  *
+ *   ADD response lines:
+ *     "INSTANCE\t<instantiated path>\n"
+ *     "KEY\t<name>\t<value>\n"
+ *     "ERROR\t<param>\t<err_code>\t<err_msg>\n"      (a parameter the agent did not apply)
+ *
+ *   DELETE response lines:
+ *     "AFFECTED\t<path>\n"
+ *     "UNAFFECTED\t<path>\t<err_code>\t<err_msg>\n"
+ *
+ *   GET_SUPPORTED_DM response lines:
+ *     "OBJECT\t<path>\t<ReadOnly|AddDelete|AddOnly|DeleteOnly>\t<multi-instance 0|1>\n"
+ *     "PARAM\t<object path>\t<name>\t<ReadOnly|ReadWrite|WriteOnly>\t<value type>\n"
+ *     "COMMAND\t<object path>\t<name>\t<Sync|Async|Unknown>\t<input args, comma separated>\t<output args>\n"
+ *     "EVENT\t<object path>\t<name>\t<args, comma separated>\n"
+ *     "ERROR\t<path>\t<err_code>\t<err_msg>\n"
+ *
+ *   GET_INSTANCES response lines:
+ *     "INSTANCE\t<instance path>\n"
+ *     "KEY\t<instance path>\t<name>\t<value>\n"
+ *     "ERROR\t<path>\t<err_code>\t<err_msg>\n"
+ *
  * Subscription notification type constants
  * -----------------------------------------
  *   USP_SUBSCRIPTION_VALUE_CHANGE    – notify when a parameter changes
@@ -504,7 +525,22 @@ int usp_controller_register(
 /*
  * usp_controller_add
  *
- * Send a USP ADD request (not yet implemented; returns USP_ERR_USP).
+ * Send a USP ADD request creating one instance of a table.
+ *
+ * Parameters:
+ *   handle         – non-NULL handle.
+ *   obj            – NUL-terminated table path, e.g. "Device.WiFi.SSID.".
+ *   param_paths    – array of NUL-terminated parameter names (relative to the
+ *                    new instance, e.g. "SSID"); may be NULL if param_count is 0.
+ *   param_values   – array of NUL-terminated values, parallel to param_paths.
+ *   param_count    – number of parameters.
+ *   out_result     – caller-supplied buffer for the encoded response text
+ *                    (INSTANCE, KEY and ERROR lines, see above).
+ *   out_result_len – size of out_result.
+ *
+ * Returns: USP_OK or an error code; USP_ERR_USP when the agent refused the
+ *          creation (see usp_controller_last_error).
+ * Blocking: yes.
  */
 LIBUSP_API
 int usp_controller_add(
@@ -512,46 +548,73 @@ int usp_controller_add(
     const char                 *obj,
     const char *const          *param_paths,
     const char *const          *param_values,
-    size_t                      param_count);
+    size_t                      param_count,
+    char                       *out_result,
+    size_t                      out_result_len);
 
 /*
  * usp_controller_delete
  *
- * Send a USP DELETE request (not yet implemented; returns USP_ERR_USP).
+ * Send a USP DELETE request for one instance, e.g. "Device.WiFi.SSID.3.".
+ * The response text has AFFECTED and UNAFFECTED lines (see above).
+ *
+ * Returns: USP_OK or an error code. Blocking: yes.
  */
 LIBUSP_API
 int usp_controller_delete(
     struct UspControllerHandle *handle,
-    const char *instance);
+    const char                 *instance,
+    char                       *out_result,
+    size_t                      out_result_len);
 
 /*
  * usp_controller_get_supported_dm
  *
- * Send a USP GetSupportedDM request (not yet implemented; returns USP_ERR_USP).
+ * Send a USP GetSupportedDM request for the data model under `obj`
+ * (parameters, commands, events and unique keys are all requested).
+ * first_level_only – non-zero to describe only `obj` itself, not its sub-objects.
+ * The response text has OBJECT, PARAM, COMMAND, EVENT and ERROR lines (see above).
+ *
+ * Returns: USP_OK or an error code. Blocking: yes.
  */
 LIBUSP_API
 int usp_controller_get_supported_dm(
     struct UspControllerHandle *handle,
-    const char *obj);
+    const char                 *obj,
+    int                         first_level_only,
+    char                       *out_result,
+    size_t                      out_result_len);
 
 /*
  * usp_controller_get_instances
  *
- * Send a USP GetInstances request (not yet implemented; returns USP_ERR_USP).
+ * Send a USP GetInstances request for the instances under `obj`.
+ * first_level_only – non-zero to list only direct instances of `obj`.
+ * The response text has INSTANCE, KEY and ERROR lines (see above).
+ *
+ * Returns: USP_OK or an error code. Blocking: yes.
  */
 LIBUSP_API
 int usp_controller_get_instances(
     struct UspControllerHandle *handle,
-    const char *obj);
+    const char                 *obj,
+    int                         first_level_only,
+    char                       *out_result,
+    size_t                      out_result_len);
 
 /*
  * usp_controller_get_supported_protocol
  *
- * Send a USP GetSupportedProtocol request (not yet implemented; returns USP_ERR_USP).
+ * Send a USP GetSupportedProtocol request; out_versions receives the
+ * agent's comma-separated protocol versions (e.g. "1.3,1.4,1.5").
+ *
+ * Returns: USP_OK or an error code. Blocking: yes.
  */
 LIBUSP_API
 int usp_controller_get_supported_protocol(
-    struct UspControllerHandle *handle);
+    struct UspControllerHandle *handle,
+    char                       *out_versions,
+    size_t                      out_versions_len);
 
 /*
  * usp_controller_set_timeout

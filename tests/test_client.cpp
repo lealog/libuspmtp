@@ -207,31 +207,23 @@ static void test_get_null_guard() {
 static void test_not_implemented_stubs() {
     std::puts("test_not_implemented_stubs");
 
-    auto* h = usp_controller_new("/tmp/nonexistent_uspmtp.sock",
-                                  "proto::app", "proto::agent", 1);
+    UspControllerHandle* h = usp_controller_new("/tmp/none.sock", "proto::app", "proto::agent", 1);
     CHECK(h != nullptr);
     if (!h) return;
 
-    int rc;
+    CHECK_EQ(usp_controller_register(h, "Device.TestApp."), USP_ERR_USP);
+    char err[128] = {0};
+    usp_controller_last_error(h, err, sizeof err);
+    CHECK(std::string(err).find("Not yet implemented") != std::string::npos);
 
-    rc = usp_controller_register(h, "Device.X.");
-    CHECK_EQ(rc, USP_ERR_USP);
-
-    rc = usp_controller_delete(h, "Device.X.1.");
-    CHECK_EQ(rc, USP_ERR_USP);
-
-    rc = usp_controller_get_supported_dm(h, "Device.");
-    CHECK_EQ(rc, USP_ERR_USP);
-
-    rc = usp_controller_get_instances(h, "Device.X.");
-    CHECK_EQ(rc, USP_ERR_USP);
-
-    rc = usp_controller_get_supported_protocol(h);
-    CHECK_EQ(rc, USP_ERR_USP);
-
-    char err[512];
-    usp_controller_last_error(h, err, sizeof(err));
-    CHECK(std::strstr(err, "implemented") != nullptr);
+    /* Null guards of the implemented requests do not touch the (absent) agent. */
+    char buf[64];
+    CHECK_EQ(usp_controller_add(nullptr, "Device.X.", nullptr, nullptr, 0, buf, sizeof buf), USP_ERR_NULL_POINTER);
+    CHECK_EQ(usp_controller_add(h, nullptr, nullptr, nullptr, 0, buf, sizeof buf), USP_ERR_NULL_POINTER);
+    CHECK_EQ(usp_controller_delete(h, nullptr, buf, sizeof buf), USP_ERR_NULL_POINTER);
+    CHECK_EQ(usp_controller_get_supported_dm(h, nullptr, 0, buf, sizeof buf), USP_ERR_NULL_POINTER);
+    CHECK_EQ(usp_controller_get_instances(nullptr, "Device.X.", 0, buf, sizeof buf), USP_ERR_NULL_POINTER);
+    CHECK_EQ(usp_controller_get_supported_protocol(nullptr, buf, sizeof buf), USP_ERR_NULL_POINTER);
 
     usp_controller_free(h);
 }
@@ -700,6 +692,314 @@ static void test_destroy_controller_while_connected() {
     ::unlink(sock_path.c_str());
 }
 
+
+/* ── Mock agent that answers requests with canned frames, in order ─────────── */
+
+static int listen_unix(const std::string& sock_path) {
+    ::unlink(sock_path.c_str());
+    int srv_fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    if (srv_fd < 0) return -1;
+    sockaddr_un addr{};
+    addr.sun_family = AF_UNIX;
+    std::strncpy(addr.sun_path, sock_path.c_str(), sizeof(addr.sun_path) - 1);
+    if (::bind(srv_fd, (sockaddr*)&addr, sizeof(addr)) != 0 || ::listen(srv_fd, 2) != 0) {
+        ::close(srv_fd);
+        return -1;
+    }
+    return srv_fd;
+}
+
+/* A USP Record frame (type 3) from the agent to the app carrying `msg`. */
+static std::vector<uint8_t> agent_frame(const proto::Msg& msg) {
+    proto::NoSessionContextRecord nsc;
+    nsc.payload = msg.encode();
+    proto::Record rec;
+    rec.version = "1.5";
+    rec.to_id   = "proto::app";
+    rec.from_id = "proto::agent";
+    rec.record_type = nsc;
+    return make_uds_frame(3, rec.encode());
+}
+
+static proto::Msg response_msg(const char* id, proto::ResponseVariant resp_type) {
+    proto::Response resp;
+    resp.resp_type = std::move(resp_type);
+    proto::Body body;
+    body.msg_body = resp;
+    proto::Msg msg;
+    msg.header = proto::Header{id, proto::msg_type_of(body)};
+    msg.body = body;
+    return msg;
+}
+
+static proto::Msg error_msg(const char* id, uint32_t code, const std::string& text) {
+    proto::ErrorBody error;
+    error.err_code = code;
+    error.err_msg = text;
+    proto::Body body;
+    body.msg_body = error;
+    proto::Msg msg;
+    msg.header = proto::Header{id, proto::MsgType::Error};
+    msg.body = body;
+    return msg;
+}
+
+/* Accept one connection, complete the UDS handshake and session, then answer each request with the next reply. */
+static std::thread mock_agent(int srv_fd, std::vector<std::vector<uint8_t>> replies) {
+    return std::thread([srv_fd, replies = std::move(replies)]() {
+        int fd = ::accept(srv_fd, nullptr, nullptr);
+        if (fd < 0) return;
+        suppress_sigpipe(fd);
+
+        std::string sid = "proto::agent";
+        auto hs_frame = make_uds_frame(1, std::vector<uint8_t>(sid.begin(), sid.end()));
+        proto::Record ack;
+        ack.version = "1.5"; ack.to_id = "proto::app"; ack.from_id = "proto::agent";
+        ack.record_type = proto::UdsConnectRecord{};
+        auto ack_frame = make_uds_frame(3, ack.encode());
+
+        read_uds_frame(fd);
+        sock_write(fd, hs_frame.data(), hs_frame.size());
+        read_uds_frame(fd);
+        sock_write(fd, ack_frame.data(), ack_frame.size());
+        for (const auto& reply : replies) {
+            if (!read_uds_frame(fd)) break;
+            sock_write(fd, reply.data(), reply.size());
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        ::close(fd);
+    });
+}
+
+static std::vector<std::vector<uint8_t>> canned_discovery_replies() {
+    proto::AddResp add_resp;
+    proto::CreatedObjectResult created;
+    created.requested_path = "Device.TestApp.Item.";
+    proto::AddOperationSuccess add_ok;
+    add_ok.instantiated_path = "Device.TestApp.Item.3.";
+    add_ok.unique_keys = {{"Name", "new"}};
+    add_ok.param_errs = {{"Colour", 7010, "Unsupported parameter"}};
+    created.oper_status = proto::AddOperationStatus{add_ok};
+    add_resp.created_obj_results = {created};
+
+    proto::DeleteResp del_resp;
+    proto::DeletedObjectResult deleted;
+    deleted.requested_path = "Device.TestApp.Item.3.";
+    proto::DeleteOperationSuccess del_ok;
+    del_ok.affected_paths = {"Device.TestApp.Item.3."};
+    del_ok.unaffected_path_errs = {{"Device.TestApp.Item.3.Child.1.", 7024, "Delete failure"}};
+    deleted.oper_status = proto::DeleteOperationStatus{del_ok};
+    del_resp.deleted_obj_results = {deleted};
+
+    proto::GetSupportedDMResp gsdm_resp;
+    proto::RequestedObjectResult gsdm_result;
+    gsdm_result.req_obj_path = "Device.TestApp.";
+    proto::SupportedObjectResult object;
+    object.supported_obj_path = "Device.TestApp.Item.{i}.";
+    object.access = proto::ObjAccessType::AddDelete;
+    object.is_multi_instance = true;
+    object.supported_params = {{"Name", proto::ParamAccessType::ReadWrite, proto::ParamValueType::String,
+                                proto::ValueChangeType::Allowed}};
+    object.supported_commands = {{"Reset()", {"Hard"}, {"Status"}, proto::CmdType::Async}};
+    object.supported_events = {{"Changed!", {"Reason"}}};
+    gsdm_result.supported_objs = {object};
+    proto::RequestedObjectResult gsdm_failed;
+    gsdm_failed.req_obj_path = "Device.Missing.";
+    gsdm_failed.err_code = 7026;
+    gsdm_failed.err_msg = "Invalid path";
+    gsdm_resp.req_obj_results = {gsdm_result, gsdm_failed};
+
+    proto::GetInstancesResp gi_resp;
+    proto::InstancesPathResult gi_result;
+    gi_result.requested_path = "Device.TestApp.Item.";
+    gi_result.curr_insts = {{"Device.TestApp.Item.1.", {{"Name", "a"}}}, {"Device.TestApp.Item.2.", {{"Name", "b"}}}};
+    gi_resp.req_path_results = {gi_result};
+
+    return {
+        agent_frame(response_msg("r1", add_resp)),
+        agent_frame(response_msg("r2", del_resp)),
+        agent_frame(response_msg("r3", gsdm_resp)),
+        agent_frame(response_msg("r4", gi_resp)),
+        agent_frame(response_msg("r5", proto::GetSupportedProtocolResp{"1.3,1.4,1.5"})),
+    };
+}
+
+static void test_add_delete_discovery_cpp_api() {
+    std::puts("test_add_delete_discovery_cpp_api");
+
+    std::string sock_path = make_tmp_socket_path();
+    int srv_fd = listen_unix(sock_path);
+    if (srv_fd < 0) { std::puts("  SKIP: cannot bind/listen"); return; }
+    auto server = mock_agent(srv_fd, canned_discovery_replies());
+
+    UspController client(sock_path, "proto::app", "proto::agent");
+    client.set_timeout(std::chrono::seconds(5));
+
+    auto add = client.add("Device.TestApp.Item.", {{"Name", "new"}, {"Colour", "red"}});
+    auto* add_ok = std::get_if<AddResponse>(&add);
+    CHECK(add_ok != nullptr);
+    if (add_ok) {
+        CHECK_EQ(add_ok->instantiated_path, "Device.TestApp.Item.3.");
+        CHECK_EQ(add_ok->unique_keys.at("Name"), "new");
+        CHECK(add_ok->param_errors.size() == 1);
+        if (add_ok->param_errors.size() == 1) {
+            CHECK_EQ(add_ok->param_errors[0].path, "Colour");
+            CHECK_EQ(add_ok->param_errors[0].err_code, 7010u);
+        }
+    }
+
+    auto del = client.delete_instance("Device.TestApp.Item.3.");
+    auto* del_ok = std::get_if<DeleteResponse>(&del);
+    CHECK(del_ok != nullptr);
+    if (del_ok) {
+        CHECK_EQ(del_ok->affected_paths, std::vector<std::string>{"Device.TestApp.Item.3."});
+        CHECK(del_ok->unaffected_paths.size() == 1);
+        if (del_ok->unaffected_paths.size() == 1) CHECK_EQ(del_ok->unaffected_paths[0].err_code, 7024u);
+    }
+
+    auto gsdm = client.get_supported_dm("Device.TestApp.");
+    auto* gsdm_ok = std::get_if<SupportedDMResponse>(&gsdm);
+    CHECK(gsdm_ok != nullptr);
+    if (gsdm_ok) {
+        CHECK(gsdm_ok->objects.size() == 1);
+        if (gsdm_ok->objects.size() == 1) {
+            CHECK_EQ(gsdm_ok->objects[0].supported_obj_path, "Device.TestApp.Item.{i}.");
+            CHECK(gsdm_ok->objects[0].is_multi_instance);
+            CHECK(gsdm_ok->objects[0].supported_params.size() == 1);
+            CHECK(gsdm_ok->objects[0].supported_commands.size() == 1);
+            CHECK(gsdm_ok->objects[0].supported_events.size() == 1);
+        }
+        CHECK(gsdm_ok->errors.size() == 1);
+        if (gsdm_ok->errors.size() == 1) CHECK_EQ(gsdm_ok->errors[0].err_code, 7026u);
+    }
+
+    auto gi = client.get_instances("Device.TestApp.Item.", true);
+    auto* gi_ok = std::get_if<InstancesResponse>(&gi);
+    CHECK(gi_ok != nullptr);
+    if (gi_ok) {
+        CHECK(gi_ok->instances.size() == 2);
+        if (gi_ok->instances.size() == 2) {
+            CHECK_EQ(gi_ok->instances[1].instantiated_obj_path, "Device.TestApp.Item.2.");
+            CHECK_EQ(gi_ok->instances[1].unique_keys.at("Name"), "b");
+        }
+        CHECK(gi_ok->errors.empty());
+    }
+
+    auto gsp = client.get_supported_protocol();
+    auto* versions = std::get_if<std::string>(&gsp);
+    CHECK(versions != nullptr);
+    if (versions) CHECK_EQ(*versions, "1.3,1.4,1.5");
+
+    server.join();
+    ::close(srv_fd);
+    ::unlink(sock_path.c_str());
+}
+
+static void test_add_delete_discovery_c_api() {
+    std::puts("test_add_delete_discovery_c_api");
+
+    std::string sock_path = make_tmp_socket_path();
+    int srv_fd = listen_unix(sock_path);
+    if (srv_fd < 0) { std::puts("  SKIP: cannot bind/listen"); return; }
+    auto server = mock_agent(srv_fd, canned_discovery_replies());
+
+    UspControllerHandle* h = usp_controller_new(sock_path.c_str(), "proto::app", "proto::agent", 5);
+    CHECK(h != nullptr);
+    if (h) {
+        char out[2048];
+        const char* names[]  = {"Name", "Colour"};
+        const char* values[] = {"new", "red"};
+        CHECK_EQ(usp_controller_add(h, "Device.TestApp.Item.", names, values, 2, out, sizeof out), USP_OK);
+        CHECK_EQ(std::string(out), "INSTANCE\tDevice.TestApp.Item.3.\nKEY\tName\tnew\nERROR\tColour\t7010\tUnsupported parameter\n");
+
+        CHECK_EQ(usp_controller_delete(h, "Device.TestApp.Item.3.", out, sizeof out), USP_OK);
+        CHECK_EQ(std::string(out), "AFFECTED\tDevice.TestApp.Item.3.\nUNAFFECTED\tDevice.TestApp.Item.3.Child.1.\t7024\tDelete failure\n");
+
+        CHECK_EQ(usp_controller_get_supported_dm(h, "Device.TestApp.", 0, out, sizeof out), USP_OK);
+        CHECK_EQ(std::string(out),
+                 "OBJECT\tDevice.TestApp.Item.{i}.\tAddDelete\t1\n"
+                 "PARAM\tDevice.TestApp.Item.{i}.\tName\tReadWrite\tString\n"
+                 "COMMAND\tDevice.TestApp.Item.{i}.\tReset()\tAsync\tHard\tStatus\n"
+                 "EVENT\tDevice.TestApp.Item.{i}.\tChanged!\tReason\n"
+                 "ERROR\tDevice.Missing.\t7026\tInvalid path\n");
+
+        CHECK_EQ(usp_controller_get_instances(h, "Device.TestApp.Item.", 1, out, sizeof out), USP_OK);
+        CHECK_EQ(std::string(out),
+                 "INSTANCE\tDevice.TestApp.Item.1.\nKEY\tDevice.TestApp.Item.1.\tName\ta\n"
+                 "INSTANCE\tDevice.TestApp.Item.2.\nKEY\tDevice.TestApp.Item.2.\tName\tb\n");
+
+        char versions[32] = {0};
+        CHECK_EQ(usp_controller_get_supported_protocol(h, versions, sizeof versions), USP_OK);
+        CHECK_EQ(std::string(versions), "1.3,1.4,1.5");
+
+        usp_controller_free(h);
+    }
+    server.join();
+    ::close(srv_fd);
+    ::unlink(sock_path.c_str());
+}
+
+/* Agent refusals, mismatched response types and too-small output buffers are reported, never silently dropped. */
+static void test_request_error_paths() {
+    std::puts("test_request_error_paths");
+
+    proto::AddResp refused;
+    proto::CreatedObjectResult created;
+    created.requested_path = "Device.TestApp.Fixed.";
+    created.oper_status = proto::AddOperationStatus{proto::AddOperationFailure{7019, "Not creatable"}};
+    refused.created_obj_results = {created};
+
+    proto::GetInstancesResp gi_resp;
+    proto::InstancesPathResult gi_result;
+    gi_result.requested_path = "Device.TestApp.Item.";
+    gi_result.curr_insts = {{"Device.TestApp.Item.1.", {{"Name", "a"}}}};
+    gi_resp.req_path_results = {gi_result};
+
+    std::vector<std::vector<uint8_t>> replies = {
+        agent_frame(error_msg("e1", 7004, "Invalid arguments")),           /* add    -> Error body        */
+        agent_frame(response_msg("e2", proto::GetResp{})),                   /* delete -> wrong response    */
+        agent_frame(response_msg("e3", refused)),                            /* add    -> operation failure */
+        agent_frame(response_msg("e4", gi_resp)),                            /* get_instances, small buffer */
+        agent_frame(response_msg("e5", proto::GetSupportedDMResp{})),        /* get_supported_dm, empty     */
+    };
+
+    std::string sock_path = make_tmp_socket_path();
+    int srv_fd = listen_unix(sock_path);
+    if (srv_fd < 0) { std::puts("  SKIP: cannot bind/listen"); return; }
+    auto server = mock_agent(srv_fd, std::move(replies));
+
+    UspControllerHandle* h = usp_controller_new(sock_path.c_str(), "proto::app", "proto::agent", 5);
+    CHECK(h != nullptr);
+    if (h) {
+        char out[64] = {0};
+        char err[256] = {0};
+
+        CHECK_EQ(usp_controller_add(h, "Device.TestApp.Item.", nullptr, nullptr, 0, out, sizeof out), USP_ERR_USP);
+        usp_controller_last_error(h, err, sizeof err);
+        CHECK(std::string(err).find("7004") != std::string::npos);
+
+        CHECK_EQ(usp_controller_delete(h, "Device.TestApp.Item.1.", out, sizeof out), USP_ERR_USP);
+        usp_controller_last_error(h, err, sizeof err);
+        CHECK(std::string(err).find("unexpected response type") != std::string::npos);
+
+        CHECK_EQ(usp_controller_add(h, "Device.TestApp.Fixed.", nullptr, nullptr, 0, out, sizeof out), USP_ERR_USP);
+        usp_controller_last_error(h, err, sizeof err);
+        CHECK(std::string(err).find("7019") != std::string::npos);
+        CHECK(std::string(err).find("Not creatable") != std::string::npos);
+
+        char tiny[8];
+        CHECK_EQ(usp_controller_get_instances(h, "Device.TestApp.Item.", 0, tiny, sizeof tiny), USP_ERR_BUFFER_TOO_SMALL);
+
+        CHECK_EQ(usp_controller_get_supported_dm(h, "Device.TestApp.", 1, out, sizeof out), USP_OK);
+        CHECK_EQ(std::string(out), "");
+
+        usp_controller_free(h);
+    }
+    server.join();
+    ::close(srv_fd);
+    ::unlink(sock_path.c_str());
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════
  * main
  * ═══════════════════════════════════════════════════════════════════════════ */
@@ -723,6 +1023,9 @@ int main() {
     test_idle_session_request_latency();
     test_password_required_through_c_api();
     test_destroy_controller_while_connected();
+    test_add_delete_discovery_cpp_api();
+    test_add_delete_discovery_c_api();
+    test_request_error_paths();
 
     std::printf("\n%s: %d passed, %d failed\n",
                 (g_fail == 0) ? "PASS" : "FAIL",
