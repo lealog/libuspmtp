@@ -109,6 +109,12 @@ static void test_usp_error_kinds() {
     auto e4 = UspError::not_implemented("register");
     CHECK(e4.kind() == UspError::Kind::NotImplemented);
     CHECK(e4.to_string().find("register") != std::string::npos);
+
+    /* A broken pipe / closed peer is a lost connection: callers must reconnect, not report a bad frame. */
+    auto e5 = UspError::from_transport(TransportError::io("send: Broken pipe"));
+    CHECK(e5.kind() == UspError::Kind::ConnectionFailed);
+    CHECK(e5.is_recoverable());
+    CHECK(!UspError::from_transport(TransportError::protocol("bad frame")).is_recoverable());
 }
 
 static void test_vendor_defined_error_codes() {
@@ -393,8 +399,8 @@ static bool read_uds_frame(int fd) {
     return read_exact(fd, body.data(), len);
 }
 
-static void test_get_after_agent_drops_session() {
-    std::puts("test_get_after_agent_drops_session");
+static void test_get_after_agent_drops_session(int delay_ms) {
+    std::printf("test_get_after_agent_drops_session (next request after %d ms)\n", delay_ms);
 
     std::string sock_path = make_tmp_socket_path();
     ::unlink(sock_path.c_str());
@@ -428,8 +434,7 @@ static void test_get_after_agent_drops_session() {
             read_uds_frame(fd);                                  /* GET */
             sock_write(fd, resp_frame.data(), resp_frame.size());
             if (conn == 0) {
-                ::close(fd);                                     /* drop the idle session */
-                std::this_thread::sleep_for(std::chrono::milliseconds(2500));
+                ::close(fd);                                     /* drop the session */
             } else {
                 std::this_thread::sleep_for(std::chrono::milliseconds(300));
                 ::close(fd);
@@ -443,7 +448,9 @@ static void test_get_after_agent_drops_session() {
     auto first = client.get("Device.DeviceInfo.SerialNumber");
     CHECK(std::holds_alternative<GetResponse>(first));
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(1800)); /* let the idle worker notice EOF and stop */
+    /* 1800 ms: the idle worker has noticed EOF and stopped.  0 ms: the next request races the close and may
+     * hit a broken pipe on send. */
+    std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
 
     auto fut = std::async(std::launch::async, [&] { return client.get("Device.DeviceInfo.SerialNumber"); });
     if (fut.wait_for(std::chrono::seconds(12)) != std::future_status::ready) {
@@ -475,7 +482,8 @@ int main() {
     test_not_implemented_stubs();
     test_usp_controller_construction();
     test_get_with_mock_agent();
-    test_get_after_agent_drops_session();
+    test_get_after_agent_drops_session(1800);
+    test_get_after_agent_drops_session(0);
 
     std::printf("\n%s: %d passed, %d failed\n",
                 (g_fail == 0) ? "PASS" : "FAIL",

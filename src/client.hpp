@@ -86,6 +86,7 @@ public:
         case TransportError::Kind::Timeout:
             return timeout();
         case TransportError::Kind::ConnectionFailed:
+        case TransportError::Kind::Io: /* peer closed / broken pipe: reconnect, do not treat as a bad frame */
             return connection_failed(te.message());
         default:
             return protocol(te.to_string());
