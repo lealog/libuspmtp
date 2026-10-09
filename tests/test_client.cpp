@@ -465,6 +465,67 @@ static void test_get_after_agent_drops_session(int delay_ms) {
     ::unlink(sock_path.c_str());
 }
 
+/*
+ * Regression: a request on an idle session must start at once.  The worker used to sit in a 1 s socket read and
+ * only looked for new commands when it returned, so each request waited 0-1 s (about 0.5 s on average).
+ */
+static void test_idle_session_request_latency() {
+    std::puts("test_idle_session_request_latency");
+
+    std::string sock_path = make_tmp_socket_path();
+    ::unlink(sock_path.c_str());
+    int srv_fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    sockaddr_un addr{};
+    addr.sun_family = AF_UNIX;
+    std::strncpy(addr.sun_path, sock_path.c_str(), sizeof(addr.sun_path) - 1);
+    if (srv_fd < 0 || ::bind(srv_fd, (sockaddr*)&addr, sizeof(addr)) != 0 || ::listen(srv_fd, 1) != 0) {
+        std::puts("  SKIP: cannot bind/listen");
+        return;
+    }
+
+    constexpr int kRequests = 6;
+    auto resp_bytes = build_get_resp_record("Device.DeviceInfo.SerialNumber", "SN-42");
+    proto::Record ack;
+    ack.version = "1.5"; ack.to_id = "proto::app"; ack.from_id = "proto::agent";
+    ack.record_type = proto::UdsConnectRecord{};
+    auto ack_frame = make_uds_frame(3, ack.encode());
+    std::string sid = "proto::agent";
+    auto hs_frame = make_uds_frame(1, std::vector<uint8_t>(sid.begin(), sid.end()));
+    auto resp_frame = make_uds_frame(3, resp_bytes);
+
+    std::thread server([&]() {
+        int fd = ::accept(srv_fd, nullptr, nullptr);
+        if (fd < 0) return;
+        suppress_sigpipe(fd);
+        read_uds_frame(fd);
+        sock_write(fd, hs_frame.data(), hs_frame.size());
+        read_uds_frame(fd);
+        sock_write(fd, ack_frame.data(), ack_frame.size());
+        for (int i = 0; i < kRequests && read_uds_frame(fd); ++i)
+            sock_write(fd, resp_frame.data(), resp_frame.size());
+        ::close(fd);
+    });
+
+    UspController client(sock_path, "proto::app", "proto::agent");
+    client.set_timeout(std::chrono::seconds(5));
+
+    long worst_ms = 0;
+    for (int i = 0; i < kRequests; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(150)); /* let the worker go idle */
+        auto t0 = std::chrono::steady_clock::now();
+        auto r = client.get("Device.DeviceInfo.SerialNumber");
+        long ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+        CHECK(std::holds_alternative<GetResponse>(r));
+        if (i > 0 && ms > worst_ms) worst_ms = ms; /* request 0 includes connecting */
+    }
+    std::printf("  slowest request on an idle session: %ld ms\n", worst_ms);
+    CHECK(worst_ms < 200);
+
+    server.join();
+    ::close(srv_fd);
+    ::unlink(sock_path.c_str());
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════
  * main
  * ═══════════════════════════════════════════════════════════════════════════ */
@@ -484,6 +545,7 @@ int main() {
     test_get_with_mock_agent();
     test_get_after_agent_drops_session(1800);
     test_get_after_agent_drops_session(0);
+    test_idle_session_request_latency();
 
     std::printf("\n%s: %d passed, %d failed\n",
                 (g_fail == 0) ? "PASS" : "FAIL",

@@ -249,13 +249,26 @@ public:
 
     /* ── Session handle (shared across copies) ─────────────────────────── */
 
+    /* Self-pipe used to wake the session worker the moment a command is queued. */
+    struct WakePipe {
+        int rd{-1};
+        int wr{-1};
+        WakePipe() = default;
+        WakePipe(const WakePipe&) = delete;
+        WakePipe& operator=(const WakePipe&) = delete;
+        ~WakePipe();
+        bool open() noexcept;
+        void wake() noexcept;
+    };
+
     struct SessionState {
         std::queue<WorkerCommand> commands;
         std::mutex                cmd_mutex;
-        std::condition_variable   cmd_cv;
-        std::jthread              worker;
         bool                      dead{false}; /* guarded by cmd_mutex; set when the worker has exited */
+        WakePipe                  wake_pipe;   /* declared before `worker`: destroyed (closed) only after it is joined */
+        std::jthread              worker;
 
+        void wake() noexcept { wake_pipe.wake(); }
         ~SessionState(); /* join happens in jthread destructor */
     };
 

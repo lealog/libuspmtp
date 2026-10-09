@@ -41,8 +41,13 @@
 #include <algorithm>
 #include <atomic>
 #include <cassert>
+#include <cerrno>
 #include <chrono>
 #include <iostream>
+
+#include <fcntl.h>
+#include <poll.h>
+#include <unistd.h>
 #include <map>
 #include <set>
 #include <string>
@@ -234,6 +239,7 @@ void session_worker(std::stop_token stop_token,
 {
     Transport transport = std::move(transport_in);
     std::vector<std::function<void()>> notify_callbacks;
+    std::stop_callback wake_on_stop(stop_token, [state_ptr] { state_ptr->wake(); });
 
     /* Whatever way the worker exits, mark the session dead and fail anything still queued, so a caller
      * never waits on a future that no thread will ever fulfil. */
@@ -381,7 +387,27 @@ void session_worker(std::stop_token stop_token,
             continue; /* Go back to check for more commands */
         }
 
-        /* 3. No command – poll for incoming frames (1s timeout via socket). */
+        /* 3. No command: sleep until the agent sends something OR a command is queued (self-pipe), so a new request
+         * starts immediately instead of waiting out a socket read timeout.  The 1 s cap only bounds how late a stop
+         * request or a silently dead socket is noticed. */
+        {
+            pollfd fds[2];
+            fds[0] = {transport.native_handle(), POLLIN, 0};
+            fds[1] = {state_ptr->wake_pipe.rd, POLLIN, 0};
+            int prc = ::poll(fds, 2, 1000);
+            if (prc < 0) {
+                if (errno == EINTR) continue;
+                std::cerr << "USP: session worker stopping: poll failed\n";
+                return;
+            }
+            if (fds[1].revents & POLLIN) {
+                char drain[64];
+                while (::read(state_ptr->wake_pipe.rd, drain, sizeof drain) > 0) {}
+                continue; /* new command (or stop request): go back to the top */
+            }
+            if (prc == 0 || !(fds[0].revents & (POLLIN | POLLHUP | POLLERR)))
+                continue; /* idle timeout */
+        }
         auto result = transport.recv();
 
         if (auto* rec = std::get_if<proto::Record>(&result)) {
@@ -461,7 +487,32 @@ establish_uds_session(Transport& transport,
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 UspController::SessionState::~SessionState() {
-    /* jthread destructor requests stop and joins automatically. */
+    /* jthread destructor requests stop and joins automatically; wake_pipe is closed after that. */
+}
+
+UspController::WakePipe::~WakePipe() {
+    if (rd >= 0) ::close(rd);
+    if (wr >= 0) ::close(wr);
+}
+
+bool UspController::WakePipe::open() noexcept {
+    int p[2];
+    if (::pipe(p) != 0) return false;
+    for (int fd : p) {
+        ::fcntl(fd, F_SETFL, ::fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
+        ::fcntl(fd, F_SETFD, FD_CLOEXEC);
+    }
+    rd = p[0];
+    wr = p[1];
+    return true;
+}
+
+void UspController::WakePipe::wake() noexcept {
+    if (wr >= 0) {
+        const char b = 1;
+        ssize_t r = ::write(wr, &b, 1); /* non-blocking; a full pipe already means "wake up" */
+        (void)r;
+    }
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -526,6 +577,8 @@ std::shared_ptr<UspController::SessionState> UspController::ensure_session() {
     }
 
     auto state = std::make_shared<SessionState>();
+    if (!state->wake_pipe.open())
+        throw TransportError::io("pipe() for session wake-up failed");
 
     /* Capture shared_ptr to keep SessionState alive in the worker thread. */
     auto state_shared = state;
@@ -584,7 +637,7 @@ UspResult<proto::Record> UspController::round_trip(proto::Record record) {
                 state->commands.emplace(std::move(cmd));
             }
         }
-        state->cmd_cv.notify_one();
+        state->wake();
 
         /* Wait for reply. */
         auto result = future.get();
@@ -633,7 +686,7 @@ std::optional<UspError> UspController::do_subscribe(
                 state->commands.emplace(std::move(cmd));
             }
         }
-        state->cmd_cv.notify_one();
+        state->wake();
 
         auto result = future.get();
 

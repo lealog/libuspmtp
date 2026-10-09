@@ -144,6 +144,9 @@ public:
             const std::string& endpoint_id,
             std::string* peer_endpoint_id = nullptr);
 
+    /** The underlying socket, for poll(). Ownership stays with the Transport. */
+    int native_handle() const noexcept { return fd_; }
+
     /* Non-copyable, movable. */
     Transport(const Transport&) = delete;
     Transport& operator=(const Transport&) = delete;
