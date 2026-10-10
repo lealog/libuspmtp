@@ -1087,6 +1087,10 @@ int usp_service_start(UspServiceHandle* handle, const char* const* roots, size_t
         std::vector<std::string> root_vec;
         if (int rc = cstr_array_to_vec(roots, root_count, root_vec); rc != USP_OK) return rc;
         if (root_vec.empty()) return USP_ERR_INVALID_ARGUMENT;
+        if (handle->service.running()) {               /* the worker is using the schema and callbacks */
+            handle->set_last_error("protocol error: service already started");
+            return USP_ERR_USP;
+        }
 
         if (!handle->described) {
             for (const auto& object : handle->objects)

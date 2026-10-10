@@ -28,6 +28,7 @@
  */
 
 #include "client.hpp"
+#include "session.hpp"
 
 #include <cassert>
 #include <cstdio>
@@ -744,6 +745,18 @@ static proto::Msg error_msg(const char* id, uint32_t code, const std::string& te
     return msg;
 }
 
+
+static proto::Msg request_msg_for_test(const char* id, proto::RequestVariant req_type) {
+    proto::Request req;
+    req.req_type = std::move(req_type);
+    proto::Body body;
+    body.msg_body = req;
+    proto::Msg msg;
+    msg.header = proto::Header{id, proto::msg_type_of(body)};
+    msg.body = body;
+    return msg;
+}
+
 /* Accept one connection, complete the UDS handshake and session, then answer each request with the next reply. */
 static std::thread mock_agent(int srv_fd, std::vector<std::vector<uint8_t>> replies) {
     return std::thread([srv_fd, replies = std::move(replies)]() {
@@ -1000,6 +1013,733 @@ static void test_request_error_paths() {
     ::unlink(sock_path.c_str());
 }
 
+
+/* ── Session helpers (shared by the controller and the service) ──────────── */
+
+static void test_session_helpers() {
+    std::puts("test_session_helpers");
+
+    proto::Record connect;
+    connect.record_type = proto::UdsConnectRecord{};
+    auto no_nsc = detail::extract_msg(connect);
+    CHECK(std::holds_alternative<UspError>(no_nsc));
+    if (auto* e = std::get_if<UspError>(&no_nsc)) CHECK(e->to_string().find("expected NoSessionContextRecord") != std::string::npos);
+
+    proto::NoSessionContextRecord nsc;
+    nsc.payload = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+    proto::Record garbage;
+    garbage.record_type = nsc;
+    auto bad = detail::extract_msg(garbage);
+    CHECK(std::holds_alternative<UspError>(bad));
+    if (auto* e = std::get_if<UspError>(&bad)) CHECK(e->to_string().find("failed to decode inner Msg") != std::string::npos);
+
+    proto::Body body;
+    proto::Response resp;
+    resp.resp_type = proto::GetResp{};
+    body.msg_body = resp;
+    auto reply = detail::build_reply_record("proto::a", "proto::b", "id-7", body);
+    CHECK_EQ(reply.from_id, "proto::a");
+    CHECK_EQ(reply.to_id, "proto::b");
+    auto msg = detail::extract_msg(reply);
+    CHECK(std::holds_alternative<proto::Msg>(msg));
+    if (auto* m = std::get_if<proto::Msg>(&msg)) {
+        CHECK(m->header && m->header->msg_id == "id-7" && m->header->msg_type == proto::MsgType::GetResp);
+    }
+    CHECK(detail::next_msg_id() != detail::next_msg_id());
+
+    /* establish_uds_session: the peer answers with something other than a UDSConnectRecord. */
+    {
+        std::string sock_path = make_tmp_socket_path();
+        int srv_fd = listen_unix(sock_path);
+        if (srv_fd < 0) { std::puts("  SKIP: cannot bind/listen"); return; }
+        std::thread server([srv_fd]() {
+            int fd = ::accept(srv_fd, nullptr, nullptr);
+            if (fd < 0) return;
+            suppress_sigpipe(fd);
+            read_uds_frame(fd);
+            std::string sid = "proto::agent";
+            auto hs = make_uds_frame(1, std::vector<uint8_t>(sid.begin(), sid.end()));
+            sock_write(fd, hs.data(), hs.size());
+            read_uds_frame(fd);                                    /* our connect record */
+            auto wrong = agent_frame(error_msg("x", 7003, "nope"));
+            sock_write(fd, wrong.data(), wrong.size());
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            ::close(fd);
+        });
+        auto t = Transport::connect(sock_path, std::chrono::seconds(1), "proto::app");
+        CHECK(std::holds_alternative<Transport>(t));
+        if (auto* tr = std::get_if<Transport>(&t)) {
+            auto err = detail::establish_uds_session(*tr, "proto::app", "proto::agent", std::chrono::seconds(2));
+            CHECK(err.has_value());
+            if (err) CHECK(err->to_string().find("expected UDSConnectRecord") != std::string::npos);
+        }
+        server.join();
+        ::close(srv_fd);
+        ::unlink(sock_path.c_str());
+    }
+    /* establish_uds_session: the peer stays silent past the deadline, then one that closes. */
+    for (int closes = 0; closes < 2; ++closes) {
+        std::string sock_path = make_tmp_socket_path();
+        int srv_fd = listen_unix(sock_path);
+        if (srv_fd < 0) { std::puts("  SKIP: cannot bind/listen"); return; }
+        std::thread server([srv_fd, closes]() {
+            int fd = ::accept(srv_fd, nullptr, nullptr);
+            if (fd < 0) return;
+            suppress_sigpipe(fd);
+            read_uds_frame(fd);
+            std::string sid = "proto::agent";
+            auto hs = make_uds_frame(1, std::vector<uint8_t>(sid.begin(), sid.end()));
+            sock_write(fd, hs.data(), hs.size());
+            read_uds_frame(fd);
+            std::this_thread::sleep_for(std::chrono::milliseconds(closes ? 200 : 2600));
+            ::close(fd);
+        });
+        auto t = Transport::connect(sock_path, std::chrono::seconds(1), "proto::app");
+        if (auto* tr = std::get_if<Transport>(&t)) {
+            auto err = detail::establish_uds_session(*tr, "proto::app", "proto::agent", std::chrono::seconds(2));
+            CHECK(err.has_value());
+            if (err) {
+                if (closes) CHECK(err->is_recoverable() && !err->is_timeout());
+                else CHECK(err->to_string().find("no UDS Connect acknowledgement") != std::string::npos);
+            }
+        } else {
+            CHECK(false);
+        }
+        server.join();
+        ::close(srv_fd);
+        ::unlink(sock_path.c_str());
+    }
+}
+
+/* ── Set, operate and the remaining response-parsing branches ─────────────── */
+
+static proto::SetResp set_resp_ok(const std::string& path) {
+    proto::SetResp resp;
+    proto::UpdatedObjectResult r;
+    r.requested_path = path;
+    r.oper_status = proto::OperationStatus{proto::OperationSuccess{}};
+    resp.updated_obj_results = {r};
+    return resp;
+}
+
+static void test_set_and_operate_paths() {
+    std::puts("test_set_and_operate_paths");
+
+    proto::SetResp set_failed;
+    proto::UpdatedObjectResult rf;
+    rf.requested_path = "Device.WiFi.SSID.9.";
+    rf.oper_status = proto::OperationStatus{proto::OperationFailure{7016, "Object does not exist", {}}};
+    set_failed.updated_obj_results = {rf};
+
+    proto::OperateResp op_ok;
+    proto::OperationResult ok_result;
+    ok_result.executed_command = "Device.Reboot()";
+    ok_result.operation_resp = proto::OutputArgs{{{"Status", "Scheduled"}}};
+    op_ok.operation_results = {ok_result};
+
+    proto::OperateResp op_failed;
+    proto::OperationResult failed_result;
+    failed_result.executed_command = "Device.Broken()";
+    failed_result.operation_resp = proto::CommandFailure{7022, "Command failure"};
+    op_failed.operation_results = {failed_result};
+
+    proto::OperateResp op_async;
+    proto::OperationResult async_result;
+    async_result.executed_command = "Device.Long()";
+    async_result.operation_resp = std::string("Device.LocalAgent.Request.3.");
+    op_async.operation_results = {async_result};
+
+    proto::Msg empty_body;
+    empty_body.header = proto::Header{"nobody", proto::MsgType::GetResp};
+
+    std::vector<std::vector<uint8_t>> replies = {
+        agent_frame(response_msg("s1", set_resp_ok("Device.WiFi.SSID.1."))),  /* set ok                     */
+        agent_frame(response_msg("s2", set_failed)),                           /* set: per-object failure    */
+        agent_frame(error_msg("s3", 7004, "Invalid arguments")),               /* set: Error body            */
+        agent_frame(response_msg("s4", proto::GetResp{})),                     /* set: wrong response type   */
+        agent_frame(response_msg("o1", op_ok)),                                /* operate ok                 */
+        agent_frame(response_msg("o2", op_failed)),                            /* operate: command failure   */
+        agent_frame(response_msg("o3", op_async)),                             /* operate: async, no output  */
+        agent_frame(error_msg("o4", 7002, "Request denied")),                  /* operate: Error body        */
+        agent_frame(response_msg("o5", proto::SetResp{})),                     /* operate: wrong type        */
+        agent_frame(error_msg("g1", 7006, "Permission denied")),               /* get: Error body            */
+        agent_frame(response_msg("g2", proto::OperateResp{})),                 /* get: wrong type            */
+        agent_frame(empty_body),                                               /* get: empty body            */
+        agent_frame(response_msg("g3", proto::GetSupportedProtocolResp{})),    /* get_supported_protocol: ok, empty */
+        agent_frame(error_msg("g4", 7001, "Not supported")),                   /* get_supported_dm: Error    */
+        agent_frame(response_msg("g5", proto::SetResp{})),                     /* get_instances: wrong type  */
+        agent_frame(error_msg("g6", 7001, "Not supported")),                   /* get_supported_protocol: Error */
+        agent_frame(response_msg("g7", proto::SetResp{})),                     /* get_supported_dm: wrong type */
+        agent_frame(error_msg("g8", 7001, "Not supported")),                   /* get_instances: Error */
+        agent_frame(response_msg("d1", proto::DeleteResp{})),                  /* delete: no result          */
+        agent_frame(response_msg("a1", proto::AddResp{})),                     /* add: no result             */
+        agent_frame(error_msg("d2", 7024, "Delete failure")),                  /* delete: Error body         */
+    };
+
+    std::string sock_path = make_tmp_socket_path();
+    int srv_fd = listen_unix(sock_path);
+    if (srv_fd < 0) { std::puts("  SKIP: cannot bind/listen"); return; }
+    auto server = mock_agent(srv_fd, std::move(replies));
+
+    UspController client(sock_path, "proto::app", "proto::agent");
+    client.set_timeout(std::chrono::seconds(5));
+
+    auto s1 = client.set("Device.WiFi.SSID.1.SSID", "home");
+    auto* s1ok = std::get_if<SetResponse>(&s1);
+    CHECK(s1ok != nullptr);
+    if (s1ok) CHECK_EQ(s1ok->updated, std::vector<std::string>{"Device.WiFi.SSID.1."});
+
+    auto s2 = client.set_many({{"Device.WiFi.SSID.9.SSID", "x"}, {"Device.WiFi.SSID.9.Enable", "true"}, {"NoDot", "v"}});
+    auto* s2ok = std::get_if<SetResponse>(&s2);
+    CHECK(s2ok != nullptr);
+    if (s2ok) {
+        CHECK(s2ok->errors.size() == 1 && s2ok->errors[0].err_code == 7016);
+        CHECK(s2ok->updated.empty());
+    }
+    auto s3 = client.set("Device.X", "1");
+    CHECK(std::holds_alternative<UspError>(s3));
+    if (auto* e = std::get_if<UspError>(&s3)) CHECK_EQ(e->code(), 7004u);
+    auto s4 = client.set("Device.X", "1");
+    if (auto* e = std::get_if<UspError>(&s4)) CHECK(e->to_string().find("unexpected response type for SET") != std::string::npos); else CHECK(false);
+
+    auto o1 = client.operate("Device.Reboot()", {{"Delay", "0"}});
+    auto* o1ok = std::get_if<OperateResponse>(&o1);
+    CHECK(o1ok != nullptr);
+    if (o1ok) CHECK_EQ(o1ok->output_args.at("Status"), "Scheduled");
+    auto o2 = client.operate("Device.Broken()", {});
+    if (auto* e = std::get_if<UspError>(&o2)) { CHECK_EQ(e->code(), 7022u); CHECK_EQ(e->message(), "Command failure"); } else CHECK(false);
+    auto o3 = client.operate("Device.Long()", {});
+    auto* o3ok = std::get_if<OperateResponse>(&o3);
+    CHECK(o3ok != nullptr && o3ok->output_args.empty());
+    auto o4 = client.operate("Device.Reboot()", {});
+    if (auto* e = std::get_if<UspError>(&o4)) CHECK_EQ(e->code(), 7002u); else CHECK(false);
+    auto o5 = client.operate("Device.Reboot()", {});
+    if (auto* e = std::get_if<UspError>(&o5)) CHECK(e->to_string().find("unexpected response type for OPERATE") != std::string::npos); else CHECK(false);
+
+    auto g1 = client.get("Device.Secret");
+    if (auto* e = std::get_if<UspError>(&g1)) CHECK_EQ(e->code(), 7006u); else CHECK(false);
+    auto g2 = client.get("Device.X");
+    if (auto* e = std::get_if<UspError>(&g2)) CHECK(e->to_string().find("unexpected response type for GET") != std::string::npos); else CHECK(false);
+    auto g2b = client.get("Device.X");
+    if (auto* e = std::get_if<UspError>(&g2b)) CHECK(e->to_string().find("empty body") != std::string::npos); else CHECK(false);
+    auto g3 = client.get_supported_protocol();
+    CHECK(std::holds_alternative<std::string>(g3));
+    auto g4 = client.get_supported_dm("Device.");
+    if (auto* e = std::get_if<UspError>(&g4)) CHECK_EQ(e->code(), 7001u); else CHECK(false);
+    auto g5 = client.get_instances("Device.");
+    if (auto* e = std::get_if<UspError>(&g5)) CHECK(e->to_string().find("unexpected response type for GET_INSTANCES") != std::string::npos); else CHECK(false);
+    auto g6 = client.get_supported_protocol("1.5");
+    if (auto* e = std::get_if<UspError>(&g6)) CHECK_EQ(e->code(), 7001u); else CHECK(false);
+    auto g7 = client.get_supported_dm("Device.");
+    if (auto* e = std::get_if<UspError>(&g7)) CHECK(e->to_string().find("unexpected response type for GET_SUPPORTED_DM") != std::string::npos); else CHECK(false);
+    auto g8 = client.get_instances("Device.");
+    if (auto* e = std::get_if<UspError>(&g8)) CHECK_EQ(e->code(), 7001u); else CHECK(false);
+    auto d1 = client.delete_instance("Device.X.1.");
+    if (auto* e = std::get_if<UspError>(&d1)) CHECK(e->to_string().find("carries no result") != std::string::npos); else CHECK(false);
+    auto a1 = client.add("Device.X.", {});
+    if (auto* e = std::get_if<UspError>(&a1)) CHECK(e->to_string().find("carries no result") != std::string::npos); else CHECK(false);
+    auto d2 = client.delete_instance("Device.X.1.");
+    if (auto* e = std::get_if<UspError>(&d2)) CHECK_EQ(e->code(), 7024u); else CHECK(false);
+
+    server.join();
+    ::close(srv_fd);
+    ::unlink(sock_path.c_str());
+}
+
+/* ── Subscriptions and agent-originated Notify, through the C API ─────────── */
+
+static void on_notify(void* user_data) { ++*static_cast<int*>(user_data); }
+
+static void test_subscriptions_and_notify() {
+    std::puts("test_subscriptions_and_notify");
+
+    proto::AddResp sub_ok;
+    proto::CreatedObjectResult created;
+    created.requested_path = "Device.LocalAgent.Subscription.";
+    proto::AddOperationSuccess ok;
+    ok.instantiated_path = "Device.LocalAgent.Subscription.5.";
+    created.oper_status = proto::AddOperationStatus{ok};
+    sub_ok.created_obj_results = {created};
+
+    proto::AddResp sub_exists;
+    proto::CreatedObjectResult exists;
+    exists.requested_path = "Device.LocalAgent.Subscription.";
+    exists.oper_status = proto::AddOperationStatus{proto::AddOperationFailure{7025, "Subscription ID already in use"}};
+    sub_exists.created_obj_results = {exists};
+
+    proto::AddResp sub_refused;
+    proto::CreatedObjectResult refused;
+    refused.requested_path = "Device.LocalAgent.Subscription.";
+    refused.oper_status = proto::AddOperationStatus{proto::AddOperationFailure{7006, "Permission denied"}};
+    sub_refused.created_obj_results = {refused};
+
+    proto::GetResp values;
+    proto::RequestedPathResult rr;
+    rr.requested_path = "Device.WiFi.SSID.1.SSID";
+    proto::ResolvedPathResult rp;
+    rp.resolved_path = "Device.WiFi.SSID.1.";
+    rp.result_params = {{"SSID", "home"}};
+    rr.resolved_path_results = {rp};
+    values.req_path_results = {rr};
+
+    proto::Notify notify;
+    notify.subscription_id = "sub-x";
+    notify.send_resp = true;
+    notify.notification = proto::ValueChange{"Device.WiFi.SSID.1.SSID", "away"};
+
+    std::string sock_path = make_tmp_socket_path();
+    int srv_fd = listen_unix(sock_path);
+    if (srv_fd < 0) { std::puts("  SKIP: cannot bind/listen"); return; }
+
+    std::optional<proto::Msg> notify_resp;
+    std::thread agent([&]() {
+        int fd = ::accept(srv_fd, nullptr, nullptr);
+        if (fd < 0) return;
+        suppress_sigpipe(fd);
+        std::string sid = "proto::agent";
+        auto hs = make_uds_frame(1, std::vector<uint8_t>(sid.begin(), sid.end()));
+        proto::Record ack;
+        ack.version = "1.5"; ack.to_id = "proto::app"; ack.from_id = "proto::agent";
+        ack.record_type = proto::UdsConnectRecord{};
+        auto ack_frame = make_uds_frame(3, ack.encode());
+        read_uds_frame(fd); sock_write(fd, hs.data(), hs.size());
+        read_uds_frame(fd); sock_write(fd, ack_frame.data(), ack_frame.size());
+
+        /* subscribe_and_get: Add then Get; the Notify arrives while the Get is pending, so the worker handles it inline. */
+        read_uds_frame(fd); auto f1 = agent_frame(response_msg("n1", sub_ok)); sock_write(fd, f1.data(), f1.size());
+        read_uds_frame(fd);
+        auto nf = agent_frame(request_msg_for_test("n-notify", notify)); sock_write(fd, nf.data(), nf.size());
+        auto f2 = agent_frame(response_msg("n2", values)); sock_write(fd, f2.data(), f2.size());
+        /* the NotifyResp the client owes for send_resp=true */
+        {
+            std::vector<uint8_t> payload;
+            if (read_uds_frame_payload(fd, payload)) {
+                size_t pos = 0;
+                while (pos + 5 <= payload.size()) {
+                    uint8_t type = payload[pos];
+                    uint32_t len = (payload[pos+1]<<24)|(payload[pos+2]<<16)|(payload[pos+3]<<8)|payload[pos+4];
+                    pos += 5;
+                    if (type == 3 && pos + len <= payload.size()) {
+                        auto rec = proto::Record::decode(std::vector<uint8_t>(payload.begin()+pos, payload.begin()+pos+len));
+                        if (rec) { auto m = detail::extract_msg(*rec); if (auto* mm = std::get_if<proto::Msg>(&m)) notify_resp = *mm; }
+                    }
+                    pos += len;
+                }
+            }
+        }
+        /* a Notify while idle (no request pending) also reaches the callback, with no response asked */
+        proto::Notify quiet = notify; quiet.send_resp = false;
+        auto qf = agent_frame(request_msg_for_test("n-quiet", quiet)); sock_write(fd, qf.data(), qf.size());
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        /* subscribe_many_and_get with one "already exists" result, then its Get */
+        read_uds_frame(fd); auto f3 = agent_frame(response_msg("n3", sub_exists)); sock_write(fd, f3.data(), f3.size());
+        read_uds_frame(fd); auto f4 = agent_frame(response_msg("n4", values)); sock_write(fd, f4.data(), f4.size());
+        /* a refused subscription */
+        read_uds_frame(fd); auto f5 = agent_frame(response_msg("n5", sub_refused)); sock_write(fd, f5.data(), f5.size());
+        /* an Error body */
+        read_uds_frame(fd); auto f6 = agent_frame(error_msg("n6", 7003, "Internal error")); sock_write(fd, f6.data(), f6.size());
+        /* a response of the wrong type */
+        read_uds_frame(fd); auto f7 = agent_frame(response_msg("n7", proto::GetResp{})); sock_write(fd, f7.data(), f7.size());
+        /* subscribe_and_get into a buffer too small for the values: Add, then Get */
+        read_uds_frame(fd); auto f8 = agent_frame(response_msg("n8", sub_ok)); sock_write(fd, f8.data(), f8.size());
+        read_uds_frame(fd); auto f9 = agent_frame(response_msg("n9", values)); sock_write(fd, f9.data(), f9.size());
+        /* subscribe_many_and_get into a buffer too small */
+        read_uds_frame(fd); auto f10 = agent_frame(response_msg("n10", sub_ok)); sock_write(fd, f10.data(), f10.size());
+        read_uds_frame(fd); auto f11 = agent_frame(response_msg("n11", values)); sock_write(fd, f11.data(), f11.size());
+        /* subscribe_many_and_get refused with an Error body */
+        read_uds_frame(fd); auto f12 = agent_frame(error_msg("n12", 7006, "Permission denied")); sock_write(fd, f12.data(), f12.size());
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        ::close(fd);
+    });
+
+    int notified = 0;
+    UspControllerHandle* h = usp_controller_new(sock_path.c_str(), "proto::app", "proto::agent", 5);
+    CHECK(h != nullptr);
+    if (h) {
+        char out[512] = {0};
+        CHECK_EQ(usp_controller_subscribe_and_get(h, "Device.WiFi.SSID.1.SSID", USP_SUBSCRIPTION_VALUE_CHANGE,
+                                                  on_notify, &notified, out, sizeof out), USP_OK);
+        CHECK_EQ(std::string(out), "PARAM\tDevice.WiFi.SSID.1.SSID\thome\n");
+        for (int i = 0; i < 40 && notified < 2; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        CHECK_EQ(notified, 2);
+
+        const char* paths[] = {"Device.WiFi.SSID.1.SSID", "Device.WiFi.SSID.1.SSID"};
+        int types[] = {USP_SUBSCRIPTION_OBJECT_CREATION, USP_SUBSCRIPTION_OBJECT_DELETION};
+        CHECK_EQ(usp_controller_subscribe_many_and_get(h, paths, types, 2, nullptr, nullptr, out, sizeof out), USP_OK);
+
+        CHECK_EQ(usp_controller_subscribe_and_get(h, "Device.X", USP_SUBSCRIPTION_VALUE_CHANGE, nullptr, nullptr, out, sizeof out), USP_ERR_USP);
+        char err[256] = {0};
+        usp_controller_last_error(h, err, sizeof err);
+        CHECK(std::string(err).find("Permission denied") != std::string::npos);
+        CHECK_EQ(usp_controller_subscribe_and_get(h, "Device.X", USP_SUBSCRIPTION_VALUE_CHANGE, nullptr, nullptr, out, sizeof out), USP_ERR_USP);
+        usp_controller_last_error(h, err, sizeof err);
+        CHECK(std::string(err).find("7003") != std::string::npos);
+        CHECK_EQ(usp_controller_subscribe_and_get(h, "Device.X", USP_SUBSCRIPTION_VALUE_CHANGE, nullptr, nullptr, out, sizeof out), USP_ERR_USP);
+        usp_controller_last_error(h, err, sizeof err);
+        CHECK(std::string(err).find("unexpected ADD response") != std::string::npos);
+
+        char tiny[3];
+        CHECK_EQ(usp_controller_subscribe_and_get(h, "Device.WiFi.SSID.2.SSID", USP_SUBSCRIPTION_VALUE_CHANGE, nullptr, nullptr, tiny, sizeof tiny), USP_ERR_BUFFER_TOO_SMALL);
+        const char* more_paths[] = {"Device.WiFi.SSID.3.SSID"};
+        CHECK_EQ(usp_controller_subscribe_many_and_get(h, more_paths, types, 1, on_notify, &notified, tiny, sizeof tiny), USP_ERR_BUFFER_TOO_SMALL);
+        const char* denied_paths[] = {"Device.Secret.X"};
+        CHECK_EQ(usp_controller_subscribe_many_and_get(h, denied_paths, types, 1, nullptr, nullptr, out, sizeof out), USP_ERR_USP);
+        usp_controller_last_error(h, err, sizeof err);
+        CHECK(std::string(err).find("Permission denied") != std::string::npos);
+
+        /* argument guards, none of which reach the agent */
+        CHECK_EQ(usp_controller_subscribe_and_get(h, "Device.X", 42, nullptr, nullptr, out, sizeof out), USP_ERR_INVALID_ARGUMENT);
+        CHECK_EQ(usp_controller_subscribe_and_get(nullptr, "Device.X", 0, nullptr, nullptr, out, sizeof out), USP_ERR_NULL_POINTER);
+        CHECK_EQ(usp_controller_subscribe_many_and_get(h, paths, types, 0, nullptr, nullptr, out, sizeof out), USP_ERR_INVALID_ARGUMENT);
+        CHECK_EQ(usp_controller_subscribe_many_and_get(h, nullptr, types, 1, nullptr, nullptr, out, sizeof out), USP_ERR_NULL_POINTER);
+        int bad_types[] = {99};
+        CHECK_EQ(usp_controller_subscribe_many_and_get(h, paths, bad_types, 1, nullptr, nullptr, out, sizeof out), USP_ERR_INVALID_ARGUMENT);
+        const char* null_paths[] = {nullptr};
+        CHECK_EQ(usp_controller_subscribe_many_and_get(h, null_paths, types, 1, nullptr, nullptr, out, sizeof out), USP_ERR_NULL_POINTER);
+        usp_controller_free(h);
+    }
+    agent.join();
+    ::close(srv_fd);
+    ::unlink(sock_path.c_str());
+
+    CHECK(notify_resp.has_value());
+    if (notify_resp && notify_resp->header && notify_resp->body) {
+        CHECK(notify_resp->header->msg_type == proto::MsgType::NotifyResp);
+        auto* r = std::get_if<proto::Response>(&notify_resp->body->msg_body);
+        auto* nr = r ? std::get_if<proto::NotifyResp>(&r->resp_type) : nullptr;
+        CHECK(nr != nullptr && nr->subscription_id == "sub-x");
+    }
+}
+
+/* ── The remaining C API branches: get/get_many/set/set_many/operate text, buffers, guards ── */
+
+static void test_c_api_controller_text_and_buffers() {
+    std::puts("test_c_api_controller_text_and_buffers");
+
+    proto::GetResp one;
+    proto::RequestedPathResult r1;
+    r1.requested_path = "Device.DeviceInfo.SerialNumber";
+    proto::ResolvedPathResult p1;
+    p1.resolved_path = "Device.DeviceInfo.";
+    p1.result_params = {{"SerialNumber", "SN-1"}};
+    r1.resolved_path_results = {p1};
+    one.req_path_results = {r1};
+
+    proto::GetResp other_path;                     /* a single value, but not under the requested name */
+    proto::RequestedPathResult r2 = r1;
+    r2.resolved_path_results[0].result_params = {{"ModelName", "M-1"}};
+    other_path.req_path_results = {r2};
+
+    proto::GetResp two_values;                     /* several values, none of them the requested one */
+    proto::RequestedPathResult r3 = r1;
+    r3.resolved_path_results[0].result_params = {{"ModelName", "M-1"}, {"SerialNumber", "SN-1"}};
+    two_values.req_path_results = {r3};
+
+    proto::GetResp with_error;
+    proto::RequestedPathResult r4;
+    r4.requested_path = "Device.Nope.";
+    r4.err_code = 7026;
+    r4.err_msg = "Invalid path";
+    with_error.req_path_results = {r1, r4};
+
+    proto::OperateResp op;
+    proto::OperationResult res;
+    res.executed_command = "Device.Reboot()";
+    res.operation_resp = proto::OutputArgs{{{"Status", "Done"}}};
+    op.operation_results = {res};
+
+    proto::SetResp set_mixed;
+    proto::UpdatedObjectResult u1;
+    u1.requested_path = "Device.A.";
+    u1.oper_status = proto::OperationStatus{proto::OperationSuccess{}};
+    proto::UpdatedObjectResult u2;
+    u2.requested_path = "Device.B.";
+    u2.oper_status = proto::OperationStatus{proto::OperationFailure{7013, "Non-writable", {}}};
+    set_mixed.updated_obj_results = {u1, u2};
+
+    /* One reply per request, in the order the calls below make them; argument guards make no request. */
+    std::vector<std::vector<uint8_t>> replies = {
+        agent_frame(response_msg("c1", one)),                       /* get: exact match                     */
+        agent_frame(response_msg("c2", other_path)),                /* get: the one value, other name       */
+        agent_frame(response_msg("c3", two_values)),                /* get: not found                       */
+        agent_frame(response_msg("c4", one)),                       /* get: buffer too small                */
+        agent_frame(error_msg("c5", 7004, "bad")),                  /* get: Error body                      */
+        agent_frame(response_msg("c6", one)),                       /* get: no buffer wanted (len 0)        */
+        agent_frame(response_msg("c7", one)),                       /* get: NULL buffer with a length       */
+        agent_frame(response_msg("c7b", with_error)),               /* get_many: result discarded (NULL, 0) */
+        agent_frame(response_msg("c7c", with_error)),               /* get_many: NULL buffer with a length  */
+        agent_frame(response_msg("c8", with_error)),                /* get_many: text                       */
+        agent_frame(response_msg("c9", with_error)),                /* get_many_depth: buffer too small     */
+        agent_frame(error_msg("c10", 7004, "bad")),                 /* get_many: Error body                 */
+        agent_frame(response_msg("c11", set_resp_ok("Device.A."))), /* set: ok                              */
+        agent_frame(error_msg("c12", 7013, "Non-writable")),        /* set: Error body                      */
+        agent_frame(response_msg("c13", set_mixed)),                /* set_many: text                       */
+        agent_frame(response_msg("c14", set_mixed)),                /* set_many: buffer too small           */
+        agent_frame(error_msg("c15", 7004, "bad")),                 /* set_many: Error body                 */
+        agent_frame(response_msg("c16", op)),                       /* operate: text                        */
+        agent_frame(response_msg("c17", op)),                       /* operate: buffer too small            */
+        agent_frame(error_msg("c18", 7002, "denied")),              /* operate: Error body                  */
+    };
+
+    std::string sock_path = make_tmp_socket_path();
+    int srv_fd = listen_unix(sock_path);
+    if (srv_fd < 0) { std::puts("  SKIP: cannot bind/listen"); return; }
+    auto server = mock_agent(srv_fd, std::move(replies));
+
+    UspControllerHandle* h = usp_controller_new(sock_path.c_str(), "proto::app", "proto::agent", 5);
+    CHECK(h != nullptr);
+    if (h) {
+        char out[512] = {0};
+        char err[256] = {0};
+        char tiny[3];
+        CHECK_EQ(usp_controller_get(h, "Device.DeviceInfo.SerialNumber", out, sizeof out), USP_OK);
+        CHECK_EQ(std::string(out), "SN-1");
+        CHECK_EQ(usp_controller_get(h, "Device.DeviceInfo.SerialNumber", out, sizeof out), USP_OK);
+        CHECK_EQ(std::string(out), "M-1");
+        CHECK_EQ(usp_controller_get(h, "Device.Nope.", out, sizeof out), USP_ERR_NOT_FOUND);
+        usp_controller_last_error(h, err, sizeof err);
+        CHECK(std::string(err).find("not found in response") != std::string::npos);
+        CHECK_EQ(usp_controller_get(h, "Device.DeviceInfo.SerialNumber", tiny, sizeof tiny), USP_ERR_BUFFER_TOO_SMALL);
+        usp_controller_last_error(h, err, sizeof err);
+        CHECK(std::string(err).find("too small") != std::string::npos);
+        CHECK_EQ(usp_controller_get(h, "Device.DeviceInfo.SerialNumber", out, sizeof out), USP_ERR_USP);
+        usp_controller_last_error(h, err, sizeof err);
+        CHECK(std::string(err).find("7004") != std::string::npos);
+        CHECK_EQ(usp_controller_get(h, "Device.DeviceInfo.SerialNumber", nullptr, 0), USP_ERR_NULL_POINTER); /* a value needs a buffer */
+        CHECK_EQ(usp_controller_get(h, "Device.DeviceInfo.SerialNumber", nullptr, 8), USP_ERR_NULL_POINTER);
+        CHECK_EQ(usp_controller_get(h, nullptr, out, sizeof out), USP_ERR_NULL_POINTER);
+
+        const char* paths[] = {"Device.DeviceInfo.SerialNumber", "Device.Nope."};
+        CHECK_EQ(usp_controller_get_many(h, paths, 2, nullptr, 0), USP_OK);                       /* result discarded */
+        CHECK_EQ(usp_controller_get_many(h, paths, 2, nullptr, 8), USP_ERR_NULL_POINTER);
+        CHECK_EQ(usp_controller_get_many(h, paths, 2, out, sizeof out), USP_OK);
+        CHECK_EQ(std::string(out), "PARAM\tDevice.DeviceInfo.SerialNumber\tSN-1\nERROR\tDevice.Nope.\t7026\tInvalid path\n");
+        CHECK_EQ(usp_controller_get_many_depth(h, paths, 2, 1, tiny, sizeof tiny), USP_ERR_BUFFER_TOO_SMALL);
+        CHECK_EQ(usp_controller_get_many(h, paths, 2, out, sizeof out), USP_ERR_USP);
+        CHECK_EQ(usp_controller_get_many(h, paths, 0, out, sizeof out), USP_ERR_INVALID_ARGUMENT);
+        CHECK_EQ(usp_controller_get_many(nullptr, paths, 2, out, sizeof out), USP_ERR_NULL_POINTER);
+        CHECK_EQ(usp_controller_get_many(h, nullptr, 2, out, sizeof out), USP_ERR_NULL_POINTER);
+        const char* null_path[] = {nullptr};
+        CHECK_EQ(usp_controller_get_many(h, null_path, 1, out, sizeof out), USP_ERR_NULL_POINTER);
+
+        CHECK_EQ(usp_controller_set(h, "Device.A.X", "1"), USP_OK);
+        CHECK_EQ(usp_controller_set(h, "Device.A.X", "1"), USP_ERR_USP);
+        CHECK_EQ(usp_controller_set(h, nullptr, "1"), USP_ERR_NULL_POINTER);
+        CHECK_EQ(usp_controller_set(h, "Device.A.X", nullptr), USP_ERR_NULL_POINTER);
+        const char* sp[] = {"Device.A.X", "Device.B.Y"};
+        const char* sv[] = {"1", "2"};
+        CHECK_EQ(usp_controller_set_many(h, sp, sv, 2, out, sizeof out), USP_OK);
+        CHECK_EQ(std::string(out), "UPDATED\tDevice.A.\nERROR\tDevice.B.\t7013\tNon-writable\n");
+        CHECK_EQ(usp_controller_set_many(h, sp, sv, 2, tiny, sizeof tiny), USP_ERR_BUFFER_TOO_SMALL);
+        CHECK_EQ(usp_controller_set_many(h, sp, sv, 2, out, sizeof out), USP_ERR_USP);
+        CHECK_EQ(usp_controller_set_many(h, sp, sv, 0, out, sizeof out), USP_ERR_INVALID_ARGUMENT);
+        CHECK_EQ(usp_controller_set_many(h, sp, nullptr, 2, out, sizeof out), USP_ERR_NULL_POINTER);
+        CHECK_EQ(usp_controller_set_many(nullptr, sp, sv, 2, out, sizeof out), USP_ERR_NULL_POINTER);
+        const char* null_value[] = {nullptr, nullptr};
+        CHECK_EQ(usp_controller_set_many(h, sp, null_value, 2, out, sizeof out), USP_ERR_NULL_POINTER);
+
+        const char* an[] = {"Delay"};
+        const char* av[] = {"0"};
+        CHECK_EQ(usp_controller_operate(h, "Device.Reboot()", an, av, 1, out, sizeof out), USP_OK);
+        CHECK_EQ(std::string(out), "OUTPUT\tStatus\tDone\n");
+        CHECK_EQ(usp_controller_operate(h, "Device.Reboot()", an, av, 1, tiny, sizeof tiny), USP_ERR_BUFFER_TOO_SMALL);
+        CHECK_EQ(usp_controller_operate(h, "Device.Reboot()", nullptr, nullptr, 0, out, sizeof out), USP_ERR_USP);
+        CHECK_EQ(usp_controller_operate(h, nullptr, nullptr, nullptr, 0, out, sizeof out), USP_ERR_NULL_POINTER);
+        CHECK_EQ(usp_controller_operate(h, "Device.X()", an, nullptr, 1, out, sizeof out), USP_ERR_NULL_POINTER);
+
+        CHECK_EQ(usp_controller_set_timeout(h, 0), USP_OK);
+        CHECK_EQ(usp_controller_set_timeout(nullptr, 1), USP_ERR_NULL_POINTER);
+        CHECK_EQ(usp_controller_last_error(h, nullptr, 8), USP_ERR_NULL_POINTER);
+        CHECK_EQ(usp_controller_last_error(h, out, 0), USP_ERR_INVALID_ARGUMENT);
+        CHECK_EQ(usp_controller_last_error(h, tiny, sizeof tiny), USP_ERR_BUFFER_TOO_SMALL);
+        CHECK_EQ(usp_error_is_vendor_defined(7800), 1);
+        CHECK_EQ(usp_error_is_vendor_defined(7026), 0);
+        usp_controller_free(h);
+    }
+    server.join();
+    ::close(srv_fd);
+    ::unlink(sock_path.c_str());
+}
+
+/* ── The agent drops the connection in the middle of a request, then stops answering ── */
+
+static void test_request_retried_after_drop_and_timeout() {
+    std::puts("test_request_retried_after_drop_and_timeout");
+
+    auto resp_bytes = build_get_resp_record("Device.DeviceInfo.SerialNumber", "SN-42");
+    proto::Record ack;
+    ack.version = "1.5"; ack.to_id = "proto::app"; ack.from_id = "proto::agent";
+    ack.record_type = proto::UdsConnectRecord{};
+    auto ack_frame = make_uds_frame(3, ack.encode());
+    std::string sid = "proto::agent";
+    auto hs_frame = make_uds_frame(1, std::vector<uint8_t>(sid.begin(), sid.end()));
+    auto resp_frame = make_uds_frame(3, resp_bytes);
+
+    std::string sock_path = make_tmp_socket_path();
+    int srv_fd = listen_unix(sock_path);
+    if (srv_fd < 0) { std::puts("  SKIP: cannot bind/listen"); return; }
+
+    /* connection 1: drop while the GET is pending; connection 2: serve one GET, then never answer the next */
+    std::thread agent([&]() {
+        for (int conn = 0; conn < 2; ++conn) {
+            int fd = ::accept(srv_fd, nullptr, nullptr);
+            if (fd < 0) return;
+            suppress_sigpipe(fd);
+            read_uds_frame(fd); sock_write(fd, hs_frame.data(), hs_frame.size());
+            read_uds_frame(fd); sock_write(fd, ack_frame.data(), ack_frame.size());
+            read_uds_frame(fd);                                 /* the GET */
+            if (conn == 1) {
+                sock_write(fd, resp_frame.data(), resp_frame.size());
+                read_uds_frame(fd);                             /* the next GET: left unanswered */
+                std::this_thread::sleep_for(std::chrono::milliseconds(3000));
+            }
+            ::close(fd);
+        }
+    });
+
+    UspController client(sock_path, "proto::app", "proto::agent");
+    client.set_timeout(std::chrono::seconds(1));
+    auto first = client.get("Device.DeviceInfo.SerialNumber");        /* dropped, then served on a new connection */
+    CHECK(std::holds_alternative<GetResponse>(first));
+    if (auto* e = std::get_if<UspError>(&first)) std::fprintf(stderr, "  first: %s\n", e->to_string().c_str());
+    auto t0 = std::chrono::steady_clock::now();
+    auto second = client.get("Device.DeviceInfo.SerialNumber");       /* never answered: times out, reconnect fails */
+    long ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+    auto* err = std::get_if<UspError>(&second);
+    CHECK(err != nullptr);
+    if (err) CHECK(err->is_recoverable());
+    CHECK(ms >= 900 && ms < 4500);
+
+    agent.join();
+    ::close(srv_fd);
+    ::unlink(sock_path.c_str());
+}
+
+
+/* ── Discovery through the C API: every enum string, and the buffer/Error branch of each call ── */
+
+static void test_c_api_discovery_errors_and_enums() {
+    std::puts("test_c_api_discovery_errors_and_enums");
+
+    proto::GetSupportedDMResp gsdm;
+    proto::RequestedObjectResult result;
+    result.req_obj_path = "Device.Zoo.";
+    proto::SupportedObjectResult ro, ao, dl;
+    ro.supported_obj_path = "Device.Zoo.";
+    ro.access = proto::ObjAccessType::ReadOnly;
+    ro.supported_params = {
+        {"A", proto::ParamAccessType::ReadOnly,  proto::ParamValueType::Unknown,      proto::ValueChangeType::Unknown},
+        {"B", proto::ParamAccessType::WriteOnly, proto::ParamValueType::Base64,       proto::ValueChangeType::Allowed},
+        {"C", proto::ParamAccessType::ReadWrite, proto::ParamValueType::Boolean,      proto::ValueChangeType::Allowed},
+        {"D", proto::ParamAccessType::ReadOnly,  proto::ParamValueType::DateTime,     proto::ValueChangeType::Allowed},
+        {"E", proto::ParamAccessType::ReadOnly,  proto::ParamValueType::Decimal,      proto::ValueChangeType::Allowed},
+        {"F", proto::ParamAccessType::ReadOnly,  proto::ParamValueType::HexBinary,    proto::ValueChangeType::Allowed},
+        {"G", proto::ParamAccessType::ReadOnly,  proto::ParamValueType::Int,          proto::ValueChangeType::Allowed},
+        {"H", proto::ParamAccessType::ReadOnly,  proto::ParamValueType::Long,         proto::ValueChangeType::Allowed},
+        {"I", proto::ParamAccessType::ReadOnly,  proto::ParamValueType::UnsignedInt,  proto::ValueChangeType::Allowed},
+        {"J", proto::ParamAccessType::ReadOnly,  proto::ParamValueType::UnsignedLong, proto::ValueChangeType::Allowed},
+    };
+    ro.supported_commands = {{"Sync()", {}, {}, proto::CmdType::Sync}, {"Odd()", {}, {}, proto::CmdType::Unknown}};
+    ao.supported_obj_path = "Device.Zoo.AddOnly.{i}.";
+    ao.access = proto::ObjAccessType::AddOnly;
+    ao.is_multi_instance = true;
+    dl.supported_obj_path = "Device.Zoo.DeleteOnly.{i}.";
+    dl.access = proto::ObjAccessType::DeleteOnly;
+    dl.is_multi_instance = true;
+    result.supported_objs = {ro, ao, dl};
+    gsdm.req_obj_results = {result};
+
+    proto::AddResp add_resp;
+    proto::CreatedObjectResult created;
+    created.requested_path = "Device.Zoo.AddOnly.";
+    proto::AddOperationSuccess add_ok;
+    add_ok.instantiated_path = "Device.Zoo.AddOnly.1.";
+    created.oper_status = proto::AddOperationStatus{add_ok};
+    add_resp.created_obj_results = {created};
+
+    proto::DeleteResp del_resp;
+    proto::DeletedObjectResult deleted;
+    deleted.requested_path = "Device.Zoo.DeleteOnly.1.";
+    proto::DeleteOperationSuccess del_ok;
+    del_ok.affected_paths = {"Device.Zoo.DeleteOnly.1."};
+    deleted.oper_status = proto::DeleteOperationStatus{del_ok};
+    del_resp.deleted_obj_results = {deleted};
+
+    proto::GetInstancesResp gi_resp;
+    proto::InstancesPathResult gi_result;
+    gi_result.requested_path = "Device.Zoo.AddOnly.";
+    gi_result.curr_insts = {{"Device.Zoo.AddOnly.1.", {}}};
+    gi_resp.req_path_results = {gi_result};
+
+    std::vector<std::vector<uint8_t>> replies = {
+        agent_frame(response_msg("z1", gsdm)),                                  /* gsdm: every enum string      */
+        agent_frame(response_msg("z2", gsdm)),                                  /* gsdm: buffer too small       */
+        agent_frame(error_msg("z3", 7001, "Not supported")),                    /* gsdm: Error body             */
+        agent_frame(response_msg("z4", add_resp)),                              /* add: buffer too small        */
+        agent_frame(error_msg("z5", 7006, "Permission denied")),                /* add: Error body              */
+        agent_frame(response_msg("z6", del_resp)),                              /* delete: buffer too small     */
+        agent_frame(error_msg("z7", 7006, "Permission denied")),                /* delete: Error body           */
+        agent_frame(response_msg("z8", gi_resp)),                               /* get_instances: buffer small  */
+        agent_frame(error_msg("z9", 7001, "Not supported")),                    /* get_instances: Error body    */
+        agent_frame(response_msg("z10", proto::GetSupportedProtocolResp{"1.5"})), /* gsp: buffer too small      */
+        agent_frame(error_msg("z11", 7001, "Not supported")),                   /* gsp: Error body              */
+    };
+
+    std::string sock_path = make_tmp_socket_path();
+    int srv_fd = listen_unix(sock_path);
+    if (srv_fd < 0) { std::puts("  SKIP: cannot bind/listen"); return; }
+    auto server = mock_agent(srv_fd, std::move(replies));
+
+    UspControllerHandle* h = usp_controller_new(sock_path.c_str(), "proto::app", "proto::agent", 5);
+    CHECK(h != nullptr);
+    if (h) {
+        char out[2048] = {0};
+        char tiny[3];
+        char err[256] = {0};
+        CHECK_EQ(usp_controller_get_supported_dm(h, "Device.Zoo.", 1, out, sizeof out), USP_OK);
+        std::string text = out;
+        for (const char* expected : {"OBJECT\tDevice.Zoo.\tReadOnly\t0\n", "OBJECT\tDevice.Zoo.AddOnly.{i}.\tAddOnly\t1\n",
+                                     "OBJECT\tDevice.Zoo.DeleteOnly.{i}.\tDeleteOnly\t1\n",
+                                     "\tA\tReadOnly\tUnknown\n", "\tB\tWriteOnly\tBase64\n", "\tC\tReadWrite\tBoolean\n",
+                                     "\tD\tReadOnly\tDateTime\n", "\tE\tReadOnly\tDecimal\n", "\tF\tReadOnly\tHexBinary\n",
+                                     "\tG\tReadOnly\tInt\n", "\tH\tReadOnly\tLong\n", "\tI\tReadOnly\tUnsignedInt\n",
+                                     "\tJ\tReadOnly\tUnsignedLong\n", "COMMAND\tDevice.Zoo.\tSync()\tSync\t\t\n",
+                                     "COMMAND\tDevice.Zoo.\tOdd()\tUnknown\t\t\n"}) {
+            bool found = text.find(expected) != std::string::npos;
+            if (!found) std::fprintf(stderr, "  missing %s in:\n%s", expected, text.c_str());
+            CHECK(found);
+        }
+        CHECK_EQ(usp_controller_get_supported_dm(h, "Device.Zoo.", 1, tiny, sizeof tiny), USP_ERR_BUFFER_TOO_SMALL);
+        CHECK_EQ(usp_controller_get_supported_dm(h, "Device.Zoo.", 1, out, sizeof out), USP_ERR_USP);
+        usp_controller_last_error(h, err, sizeof err);
+        CHECK(std::string(err).find("7001") != std::string::npos);
+        CHECK_EQ(usp_controller_get_supported_dm(h, nullptr, 1, out, sizeof out), USP_ERR_NULL_POINTER);
+
+        const char* names[] = {"Name"};
+        const char* values[] = {"x"};
+        CHECK_EQ(usp_controller_add(h, "Device.Zoo.AddOnly.", names, values, 1, tiny, sizeof tiny), USP_ERR_BUFFER_TOO_SMALL);
+        CHECK_EQ(usp_controller_add(h, "Device.Zoo.AddOnly.", nullptr, nullptr, 0, out, sizeof out), USP_ERR_USP);
+        CHECK_EQ(usp_controller_add(h, "Device.Zoo.AddOnly.", names, nullptr, 1, out, sizeof out), USP_ERR_NULL_POINTER);
+        CHECK_EQ(usp_controller_add(h, nullptr, nullptr, nullptr, 0, out, sizeof out), USP_ERR_NULL_POINTER);
+
+        CHECK_EQ(usp_controller_delete(h, "Device.Zoo.DeleteOnly.1.", tiny, sizeof tiny), USP_ERR_BUFFER_TOO_SMALL);
+        CHECK_EQ(usp_controller_delete(h, "Device.Zoo.DeleteOnly.1.", out, sizeof out), USP_ERR_USP);
+        CHECK_EQ(usp_controller_delete(h, nullptr, out, sizeof out), USP_ERR_NULL_POINTER);
+
+        CHECK_EQ(usp_controller_get_instances(h, "Device.Zoo.AddOnly.", 1, tiny, sizeof tiny), USP_ERR_BUFFER_TOO_SMALL);
+        CHECK_EQ(usp_controller_get_instances(h, "Device.Zoo.AddOnly.", 1, out, sizeof out), USP_ERR_USP);
+        CHECK_EQ(usp_controller_get_instances(h, nullptr, 1, out, sizeof out), USP_ERR_NULL_POINTER);
+
+        CHECK_EQ(usp_controller_get_supported_protocol(h, tiny, sizeof tiny), USP_ERR_BUFFER_TOO_SMALL);
+        CHECK_EQ(usp_controller_get_supported_protocol(h, out, sizeof out), USP_ERR_USP);
+        CHECK_EQ(usp_controller_get_supported_protocol(nullptr, out, sizeof out), USP_ERR_NULL_POINTER);
+        usp_controller_free(h);
+    }
+    server.join();
+    ::close(srv_fd);
+    ::unlink(sock_path.c_str());
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════
  * main
  * ═══════════════════════════════════════════════════════════════════════════ */
@@ -1026,6 +1766,12 @@ int main() {
     test_add_delete_discovery_cpp_api();
     test_add_delete_discovery_c_api();
     test_request_error_paths();
+    test_session_helpers();
+    test_set_and_operate_paths();
+    test_subscriptions_and_notify();
+    test_c_api_controller_text_and_buffers();
+    test_request_retried_after_drop_and_timeout();
+    test_c_api_discovery_errors_and_enums();
 
     std::printf("\n%s: %d passed, %d failed\n",
                 (g_fail == 0) ? "PASS" : "FAIL",

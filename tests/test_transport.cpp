@@ -27,6 +27,7 @@
  */
 
 #include "transport.hpp"
+#include "usp_proto.hpp"
 
 #include <array>
 #include <cassert>
@@ -416,6 +417,158 @@ static void test_handshake_rejected_by_peer() {
     }
 }
 
+
+/* ── Malformed input from the peer and socket failures ───────────────────── */
+
+/* A server that completes the handshake, then writes `bytes` raw and waits before closing. */
+static std::thread raw_server(int srv_fd, std::vector<uint8_t> bytes, int hold_ms = 300) {
+    return std::thread([srv_fd, bytes = std::move(bytes), hold_ms]() {
+        int cli_fd = ::accept(srv_fd, nullptr, nullptr);
+        if (cli_fd < 0) { ::close(srv_fd); return; }
+        std::vector<uint8_t> payload;
+        read_frame_payload(cli_fd, payload);
+        auto hs = encode_uds_frame(FRAME_TYPE_HANDSHAKE, std::vector<uint8_t>{'p','r','o','t','o',':',':','s','r','v'});
+        ::write(cli_fd, hs.data(), hs.size());
+        if (!bytes.empty()) ::write(cli_fd, bytes.data(), bytes.size());
+        std::this_thread::sleep_for(std::chrono::milliseconds(hold_ms));
+        ::close(cli_fd);
+        ::close(srv_fd);
+    });
+}
+
+static std::vector<uint8_t> raw_frame(uint32_t outer_len, const std::vector<uint8_t>& payload, bool good_sync = true) {
+    std::vector<uint8_t> f;
+    if (good_sync) { for (auto b : UDS_SYNC) f.push_back(b); } else { f = {0x00, 0x11, 0x22, 0x33}; }
+    f.push_back((outer_len >> 24) & 0xFF); f.push_back((outer_len >> 16) & 0xFF);
+    f.push_back((outer_len >>  8) & 0xFF); f.push_back( outer_len        & 0xFF);
+    f.insert(f.end(), payload.begin(), payload.end());
+    return f;
+}
+
+static void expect_recv_protocol_error(const char* name, std::vector<uint8_t> bytes, const char* fragment) {
+    std::string sock_path = make_tmp_socket_path();
+    int srv_fd = listen_on(sock_path);
+    if (srv_fd < 0) { std::puts("  SKIP: cannot bind/listen"); return; }
+    auto server = raw_server(srv_fd, std::move(bytes));
+    auto result = Transport::connect(sock_path, std::chrono::seconds(2), "proto::client");
+    CHECK(std::holds_alternative<Transport>(result));
+    if (auto* t = std::get_if<Transport>(&result)) {
+        auto r = t->recv();
+        auto* err = std::get_if<TransportError>(&r);
+        CHECK(err != nullptr);
+        if (err) {
+            bool ok = err->to_string().find(fragment) != std::string::npos;
+            if (!ok) std::fprintf(stderr, "  %s: got %s\n", name, err->to_string().c_str());
+            CHECK(ok);
+        }
+    }
+    server.join();
+    ::unlink(sock_path.c_str());
+}
+
+static void test_recv_rejects_malformed_frames() {
+    std::puts("test_recv_rejects_malformed_frames");
+
+    std::vector<uint8_t> tlv_err = {FRAME_TYPE_ERROR, 0, 0, 0, 3, 'b', 'a', 'd'};
+    expect_recv_protocol_error("bad sync",        raw_frame(8, tlv_err, false),           "invalid UDS sync bytes");
+    expect_recv_protocol_error("too small",       raw_frame(2, {0x01, 0x02}),              "too small for TLV header");
+    expect_recv_protocol_error("too large",       raw_frame(0x7FFFFFFF, {}),               "exceeds maximum");
+    expect_recv_protocol_error("truncated TLV",   raw_frame(7, {FRAME_TYPE_USP_RECORD, 0, 0, 0, 9, 1, 2}), "exceeds remaining frame payload");
+    expect_recv_protocol_error("error frame",     raw_frame(8, tlv_err),                   "ob-uspa error frame: bad");
+    std::vector<uint8_t> tlv_other = {0x09, 0, 0, 0, 1, 0x00};
+    expect_recv_protocol_error("no record TLV",   raw_frame(6, tlv_other),                 "did not contain a USP Record TLV");
+    std::vector<uint8_t> tlv_garbage = {FRAME_TYPE_USP_RECORD, 0, 0, 0, 4, 0xFF, 0xFF, 0xFF, 0xFF};
+    expect_recv_protocol_error("undecodable",     raw_frame(9, tlv_garbage),               "failed to decode USP Record");
+    /* A complete TLV followed by two stray bytes: too short to be another TLV header. */
+    std::vector<uint8_t> tlv_trailing = {0x09, 0, 0, 0, 1, 0x00, 0xAA, 0xBB};
+    expect_recv_protocol_error("cut header",      raw_frame(8, tlv_trailing),              "truncated TLV header");
+}
+
+static void test_recv_timeout_and_closed_peer() {
+    std::puts("test_recv_timeout_and_closed_peer");
+
+    std::string sock_path = make_tmp_socket_path();
+    int srv_fd = listen_on(sock_path);
+    if (srv_fd < 0) { std::puts("  SKIP: cannot bind/listen"); return; }
+    auto server = raw_server(srv_fd, {}, 2500);
+    auto result = Transport::connect(sock_path, std::chrono::seconds(1), "proto::client");
+    CHECK(std::holds_alternative<Transport>(result));
+    if (auto* t = std::get_if<Transport>(&result)) {
+        auto r = t->recv();                               /* nothing arrives within SO_RCVTIMEO */
+        auto* err = std::get_if<TransportError>(&r);
+        CHECK(err != nullptr && err->is_timeout());
+        server.join();                                    /* the peer closes */
+        auto r2 = t->recv();
+        auto* err2 = std::get_if<TransportError>(&r2);
+        CHECK(err2 != nullptr && !err2->is_timeout() && err2->is_recoverable());
+        proto::Record rec;
+        rec.version = "1.5";
+        rec.record_type = proto::UdsConnectRecord{};
+        auto send_err = t->send(rec);                     /* writing to a closed peer */
+        CHECK(send_err.has_value());
+        if (send_err) CHECK(send_err->kind() == TransportError::Kind::Io);
+    } else {
+        server.join();
+    }
+    ::unlink(sock_path.c_str());
+}
+
+static void test_handshake_reply_without_handshake_tlv() {
+    std::puts("test_handshake_reply_without_handshake_tlv");
+
+    std::string sock_path = make_tmp_socket_path();
+    int srv_fd = listen_on(sock_path);
+    if (srv_fd < 0) { std::puts("  SKIP: cannot bind/listen"); return; }
+    std::thread server([srv_fd]() {
+        int cli_fd = ::accept(srv_fd, nullptr, nullptr);
+        if (cli_fd < 0) { ::close(srv_fd); return; }
+        std::vector<uint8_t> payload;
+        read_frame_payload(cli_fd, payload);
+        auto reply = encode_uds_frame(FRAME_TYPE_USP_RECORD, std::vector<uint8_t>{0x01});
+        ::write(cli_fd, reply.data(), reply.size());
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        ::close(cli_fd);
+        ::close(srv_fd);
+    });
+    auto result = Transport::connect(sock_path, std::chrono::seconds(2), "proto::client");
+    auto* err = std::get_if<TransportError>(&result);
+    CHECK(err != nullptr);
+    if (err) CHECK(err->to_string().find("did not contain a Handshake TLV") != std::string::npos);
+    server.join();
+    ::unlink(sock_path.c_str());
+}
+
+static void test_connect_argument_errors_and_move() {
+    std::puts("test_connect_argument_errors_and_move");
+
+    std::string too_long(200, 'x');
+    auto result = Transport::connect("/tmp/" + too_long + ".sock", std::chrono::seconds(1), "proto::client");
+    auto* err = std::get_if<TransportError>(&result);
+    CHECK(err != nullptr);
+    if (err) CHECK(err->to_string().find("socket path too long") != std::string::npos);
+
+    /* Move assignment transfers the descriptor and leaves the source empty. */
+    std::string sock_path = make_tmp_socket_path();
+    int srv_fd = listen_on(sock_path);
+    if (srv_fd < 0) { std::puts("  SKIP: cannot bind/listen"); return; }
+    auto server = raw_server(srv_fd, {}, 200);
+    auto a = Transport::connect(sock_path, std::chrono::seconds(1), "proto::client");
+    CHECK(std::holds_alternative<Transport>(a));
+    if (auto* t = std::get_if<Transport>(&a)) {
+        int fd = t->native_handle();
+        auto other = Transport::connect("/nonexistent/none.sock", std::chrono::seconds(1), "proto::x");
+        CHECK(std::holds_alternative<TransportError>(other));
+        Transport moved = std::move(*t);
+        CHECK_EQ(moved.native_handle(), fd);
+        CHECK_EQ(t->native_handle(), -1);
+        Transport target = std::move(moved);
+        target = std::move(target);                       /* self-move is a no-op */
+        CHECK_EQ(target.native_handle(), fd);
+    }
+    server.join();
+    ::unlink(sock_path.c_str());
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════
  * main
  * ═══════════════════════════════════════════════════════════════════════════ */
@@ -431,6 +584,10 @@ int main() {
     test_handshake_and_send_recv();
     test_handshake_password_tlv();
     test_handshake_rejected_by_peer();
+    test_recv_rejects_malformed_frames();
+    test_recv_timeout_and_closed_peer();
+    test_handshake_reply_without_handshake_tlv();
+    test_connect_argument_errors_and_move();
 
     std::printf("\n%s: %d passed, %d failed\n",
                 (g_fail == 0) ? "PASS" : "FAIL",

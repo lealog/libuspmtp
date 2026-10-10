@@ -797,13 +797,17 @@ UspService::~UspService() {
 void UspService::set_timeout(std::chrono::seconds timeout) { timeout_ = timeout; }
 void UspService::set_password(std::string password)        { password_ = std::move(password); }
 
+/* The worker reads the schema and the handlers without the lock while it serves requests, so both
+ * are fixed from start() to stop(): a change while running is ignored rather than raced. */
 void UspService::add_object(ServiceObject object) {
     std::lock_guard lk(state_->mutex);
+    if (state_->worker.joinable() && !state_->dead) return;
     state_->objects.push_back(std::move(object));
 }
 
 void UspService::set_handlers(ServiceHandlers handlers) {
     std::lock_guard lk(state_->mutex);
+    if (state_->worker.joinable() && !state_->dead) return;
     state_->handlers = std::move(handlers);
 }
 

@@ -74,7 +74,7 @@ ctest --test-dir build-asan --output-on-failure
 
 The library can be instrumented for gcov; the `coverage` target reports line
 coverage of `src/` (generated protobuf code excluded) and fails below
-`LIBUSPMTP_COVERAGE_MIN_LINES` (default 75 %). It needs `gcovr`.
+`LIBUSPMTP_COVERAGE_MIN_LINES` (default 90 %). It needs `gcovr`.
 
 ```bash
 cmake -S . -B build-cov \

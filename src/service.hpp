@@ -147,7 +147,10 @@ public:
     void set_timeout(std::chrono::seconds timeout);
     void set_password(std::string password);
 
-    /** Describe the data model. Every object must be under one of the roots passed to start(). */
+    /**
+     * Describe the data model. Every object must be under one of the roots passed to start().
+     * Both are fixed while the service runs: a call between start() and stop() is ignored.
+     */
     void add_object(ServiceObject object);
     void set_handlers(ServiceHandlers handlers);
 

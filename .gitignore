@@ -49,3 +49,6 @@ compile_commands.json
 # IDE/editor metadata
 .idea/
 .vscode/
+
+# Local coverage/sanitizer build trees (e.g. build-cov, build-asan)
+build-*/

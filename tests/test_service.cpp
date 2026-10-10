@@ -1218,6 +1218,521 @@ static void test_c_api_exchange() {
     CHECK(dreq != nullptr && std::get_if<proto::Deregister>(&dreq->req_type) != nullptr);
 }
 
+
+/* ── The subscription table, nested single objects, and every refusal a handler-less model gives ── */
+
+static proto::RegisterResp register_ok(const std::string& path) {
+    proto::RegisterResp resp;
+    proto::RegisteredPathResult ok;
+    ok.requested_path = path;
+    ok.oper_status = proto::RegisterOperationStatus{proto::RegisterOperationSuccess{path}};
+    resp.registered_path_results = {ok};
+    return resp;
+}
+
+static proto::CreateObject subscription_create(const std::string& id, const std::string& type,
+                                               const std::string& refs, const std::string& enable = "true") {
+    proto::CreateObject sub;
+    sub.obj_path = "Device.LocalAgent.Subscription.";
+    sub.param_settings = {{"ID", id, true}, {"NotifType", type, true}, {"ReferenceList", refs, true}, {"Enable", enable, false}};
+    return sub;
+}
+
+static void test_subscription_table_and_nested_objects() {
+    std::puts("test_subscription_table_and_nested_objects");
+
+    std::string sock_path = make_tmp_socket_path();
+    int srv_fd = listen_unix(sock_path);
+    if (srv_fd < 0) { std::puts("  SKIP: cannot bind/listen"); return; }
+
+    struct Seen {
+        std::optional<proto::Msg> bad_sub, subs, get, instances, sub_set, sub_set_partial, set_required, set_partial,
+                                  del, add, op_nodot, op_nohandler, notify_resp, deleted, event, dereg;
+    } seen;
+    std::promise<void> ready;
+    auto ready_f = ready.get_future();
+
+    std::thread broker([&]() {
+        int fd = broker_accept(srv_fd);
+        if (fd < 0) { ready.set_value(); return; }
+        auto reg = read_msg(fd);
+        if (reg && reg->header) send_msg(fd, response_msg(reg->header->msg_id, register_ok("Device.TestApp.")));
+
+        proto::Add bad;
+        proto::CreateObject incomplete;
+        incomplete.obj_path = "Device.LocalAgent.Subscription.";
+        incomplete.param_settings = {{"ID", "sub-0", true}};
+        bad.create_objs = {incomplete};
+        send_msg(fd, request_msg("n1", bad));
+        seen.bad_sub = read_msg(fd);
+
+        proto::Add subs;
+        subs.create_objs = {subscription_create("sub-1", "ValueChange", "Device.TestApp.Stats."),
+                            subscription_create("sub-2", "ObjectDeletion", "Device.TestApp.Item.,"),
+                            subscription_create("sub-3", "Event", "Device.TestApp.Changed!"),
+                            subscription_create("sub-4", "ValueChange", "Device.TestApp.Enable", "0")};
+        send_msg(fd, request_msg("n2", subs));
+        seen.subs = read_msg(fd);
+
+        proto::Get get;
+        get.param_paths = {"Device.LocalAgent.Subscription.", "Device.LocalAgent.Subscription.2.",
+                           "Device.LocalAgent.Subscription.1.ID", "Device.LocalAgent.Subscription.9.Enable",
+                           "", "NoDot", "Device.TestApp.Item.{i}.", "Device.Nope.", "Device.TestApp.Stats.Hits",
+                           "Device.TestApp.Item.", "Device.TestApp."};
+        send_msg(fd, request_msg("n3", get));
+        seen.get = read_msg(fd);
+
+        proto::GetInstances gi;
+        gi.obj_paths = {"Device.TestApp.Item.", "Device.LocalAgent.Subscription.", "Device.Nope.", "Device.TestApp."};
+        send_msg(fd, request_msg("n4", gi));
+        seen.instances = read_msg(fd);
+
+        proto::Set sub_set;
+        proto::UpdateObject u1;
+        u1.obj_path = "Device.LocalAgent.Subscription.1.";
+        u1.param_settings = {{"Enable", "false", true}, {"NotifType", "ValueChange", false}, {"ID", "x", false}};
+        sub_set.update_objs = {u1};
+        send_msg(fd, request_msg("n5", sub_set));
+        seen.sub_set = read_msg(fd);
+
+        proto::Set sub_set_partial;
+        sub_set_partial.allow_partial = true;
+        proto::UpdateObject u2;
+        u2.obj_path = "Device.LocalAgent.Subscription.9.";
+        u2.param_settings = {{"Enable", "true", true}};
+        sub_set_partial.update_objs = {u2};
+        send_msg(fd, request_msg("n6", sub_set_partial));
+        seen.sub_set_partial = read_msg(fd);
+
+        proto::Set set_required;
+        proto::UpdateObject u3;
+        u3.obj_path = "Device.TestApp.Item.1.";
+        u3.param_settings = {{"Count", "9", true}};
+        set_required.update_objs = {u3};
+        send_msg(fd, request_msg("n7", set_required));
+        seen.set_required = read_msg(fd);
+
+        proto::Set set_partial = set_required;
+        set_partial.allow_partial = true;
+        send_msg(fd, request_msg("n8", set_partial));
+        seen.set_partial = read_msg(fd);
+
+        proto::Delete del;
+        del.allow_partial = true;
+        del.obj_paths = {"Device.LocalAgent.Subscription.4.", "Device.LocalAgent.Subscription.x.", "Device.TestApp.Item.1."};
+        send_msg(fd, request_msg("n9", del));
+        seen.del = read_msg(fd);
+
+        proto::Add add;
+        add.allow_partial = true;
+        proto::CreateObject create;
+        create.obj_path = "Device.TestApp.Item.";
+        add.create_objs = {create};
+        send_msg(fd, request_msg("n10", add));
+        seen.add = read_msg(fd);
+
+        proto::Operate nodot;
+        nodot.command = "NoDot";
+        send_msg(fd, request_msg("n11", nodot));
+        seen.op_nodot = read_msg(fd);
+        proto::Operate op;
+        op.command = "Device.TestApp.Reset()";
+        send_msg(fd, request_msg("n12", op));
+        seen.op_nohandler = read_msg(fd);
+
+        proto::Notify with_resp;
+        with_resp.subscription_id = "ctl-1";
+        with_resp.send_resp = true;
+        with_resp.notification = proto::ValueChange{"Device.X", "1"};
+        send_msg(fd, request_msg("n13", with_resp));
+        seen.notify_resp = read_msg(fd);
+        proto::Notify quiet = with_resp;
+        quiet.send_resp = false;
+        send_msg(fd, request_msg("n14", quiet));            /* nothing comes back for this one */
+
+        ready.set_value();
+        seen.deleted = read_msg(fd);
+        seen.event = read_msg(fd);
+
+        seen.dereg = read_msg(fd);
+        proto::Record bye;
+        bye.version = "1.5"; bye.to_id = "proto::svc"; bye.from_id = "proto::broker";
+        bye.record_type = proto::DisconnectRecord{"bye", 0};
+        send_record(fd, bye);                              /* the broker disconnects instead of answering */
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        ::close(fd);
+    });
+
+    UspService service(sock_path, "proto::svc");
+    service.set_timeout(std::chrono::seconds(5));
+    ServiceObject app;
+    app.path = "Device.TestApp.";
+    app.params = {{"Enable", proto::ParamAccessType::ReadWrite, proto::ParamValueType::Boolean}};
+    app.events = {{"Changed!", {"Reason"}}};
+    service.add_object(app);
+    ServiceObject stats;                                   /* a single-instance child object */
+    stats.path = "Device.TestApp.Stats.";
+    stats.params = {{"Hits", proto::ParamAccessType::ReadOnly, proto::ParamValueType::UnsignedInt}};
+    service.add_object(stats);
+    ServiceObject item;
+    item.path = "Device.TestApp.Item.{i}.";
+    item.multi_instance = true;
+    item.params = {{"Name", proto::ParamAccessType::ReadWrite, proto::ParamValueType::String},
+                   {"Count", proto::ParamAccessType::ReadOnly, proto::ParamValueType::UnsignedInt}};
+    service.add_object(item);
+    ServiceHandlers h;                                     /* get/instances/set only: no add, del, operate */
+    h.get = [](const std::string& path) -> std::optional<std::map<std::string, std::string>> {
+        if (path == "Device.TestApp.") return std::map<std::string, std::string>{{"Enable", "true"}};
+        if (path == "Device.TestApp.Stats.") return std::map<std::string, std::string>{{"Hits", "5"}};
+        if (path == "Device.TestApp.Item.1." || path == "Device.TestApp.Item.2.")
+            return std::map<std::string, std::string>{{"Name", path.substr(20, 1)}, {"Count", "1"}};
+        return std::nullopt;
+    };
+    h.instances = [](const std::string& table) {
+        std::vector<proto::CurrInstance> out;
+        if (table == "Device.TestApp.Item.") out = {{"Device.TestApp.Item.1.", {{"Name", "1"}}}, {"Device.TestApp.Item.2.", {{"Name", "2"}}}};
+        return out;
+    };
+    h.set = [](const std::string& path, const std::map<std::string, std::string>& params) -> std::optional<ParamErrors> {
+        if (path.compare(0, 20, "Device.TestApp.Item.") != 0) return std::nullopt;
+        ParamErrors errors;
+        for (auto& [name, value] : params) if (name != "Name") errors.push_back({name, 7013, "Non-writable parameter"});
+        return errors;
+    };
+    service.set_handlers(std::move(h));
+
+    auto started = service.start({"Device.TestApp."});
+    CHECK(std::holds_alternative<std::vector<RegisterResult>>(started));
+    CHECK(ready_f.wait_for(std::chrono::seconds(10)) == std::future_status::ready);
+
+    auto subs = service.subscriptions();
+    CHECK_EQ(subs.size(), 3u);
+    if (subs.size() == 3) {
+        CHECK(subs[0].id == "sub-1" && !subs[0].enable);
+        CHECK(subs[1].reference_list == std::vector<std::string>{"Device.TestApp.Item."});
+    }
+    service.value_changed("Device.TestApp.Stats.Hits", "6");          /* sub-1 was disabled by the Set: no Notify */
+    service.object_deleted("Device.TestApp.Item.2.");
+    service.event("Device.TestApp.", "Changed!", {{"Reason", "test"}});
+    service.stop();                                        /* Deregister goes out; the broker answers by disconnecting */
+    broker.join();
+    ::close(srv_fd);
+    ::unlink(sock_path.c_str());
+
+    auto* e1 = error_of(seen.bad_sub);
+    CHECK(e1 != nullptr && e1->err_code == 7004);
+    auto* a2 = response_of<proto::AddResp>(seen.subs);
+    CHECK(a2 != nullptr && a2->created_obj_results.size() == 4);
+
+    auto* g3 = response_of<proto::GetResp>(seen.get);
+    CHECK(g3 != nullptr && g3->req_path_results.size() == 11);
+    if (g3 && g3->req_path_results.size() == 11) {
+        const auto& r = g3->req_path_results;
+        CHECK_EQ(r[0].resolved_path_results.size(), 4u);
+        CHECK(r[1].resolved_path_results.size() == 1 && r[1].resolved_path_results[0].resolved_path == "Device.LocalAgent.Subscription.2.");
+        if (r[1].resolved_path_results.size() == 1) {
+            CHECK_EQ(r[1].resolved_path_results[0].result_params.at("ReferenceList"), "Device.TestApp.Item.");
+            CHECK_EQ(r[1].resolved_path_results[0].result_params.at("NotifType"), "ObjectDeletion");
+        }
+        CHECK(r[2].resolved_path_results.size() == 1 && r[2].resolved_path_results[0].result_params.at("ID") == "sub-1");
+        for (size_t i : {3u, 4u, 5u, 6u, 7u}) CHECK(r[i].err_code == 7026 && r[i].resolved_path_results.empty());
+        CHECK(r[8].resolved_path_results.size() == 1 && r[8].resolved_path_results[0].result_params.at("Hits") == "5");
+        CHECK_EQ(r[9].resolved_path_results.size(), 2u);
+        CHECK_EQ(r[10].resolved_path_results.size(), 4u);              /* TestApp, Stats, Item.1, Item.2 */
+        bool has_stats = false;
+        for (auto& rp : r[10].resolved_path_results) has_stats = has_stats || rp.resolved_path == "Device.TestApp.Stats.";
+        CHECK(has_stats);
+    }
+    auto* i4 = response_of<proto::GetInstancesResp>(seen.instances);
+    CHECK(i4 != nullptr && i4->req_path_results.size() == 4);
+    if (i4 && i4->req_path_results.size() == 4) {
+        CHECK_EQ(i4->req_path_results[0].curr_insts.size(), 2u);
+        CHECK_EQ(i4->req_path_results[1].curr_insts.size(), 4u);
+        CHECK_EQ(i4->req_path_results[2].err_code, 7026u);
+        CHECK_EQ(i4->req_path_results[3].curr_insts.size(), 2u);
+    }
+    auto* s5 = response_of<proto::SetResp>(seen.sub_set);
+    CHECK(s5 != nullptr && s5->updated_obj_results.size() == 1);
+    if (s5 && s5->updated_obj_results.size() == 1 && s5->updated_obj_results[0].oper_status) {
+        auto* ok = std::get_if<proto::OperationSuccess>(&s5->updated_obj_results[0].oper_status->oper_status);
+        CHECK(ok != nullptr && ok->updated_inst_results.size() == 1 && ok->updated_inst_results[0].param_errs.size() == 1);
+        if (ok && ok->updated_inst_results.size() == 1) CHECK_EQ(ok->updated_inst_results[0].param_errs[0].param, "ID");
+    }
+    auto* s6 = response_of<proto::SetResp>(seen.sub_set_partial);
+    CHECK(s6 != nullptr && s6->updated_obj_results.size() == 1);
+    if (s6 && s6->updated_obj_results.size() == 1 && s6->updated_obj_results[0].oper_status) {
+        auto* f = std::get_if<proto::OperationFailure>(&s6->updated_obj_results[0].oper_status->oper_status);
+        CHECK(f != nullptr && f->err_code == 7026);
+    }
+    auto* e7 = error_of(seen.set_required);
+    CHECK(e7 != nullptr && e7->err_code == 7013);
+    auto* s8 = response_of<proto::SetResp>(seen.set_partial);
+    CHECK(s8 != nullptr && s8->updated_obj_results.size() == 1);
+    if (s8 && s8->updated_obj_results.size() == 1 && s8->updated_obj_results[0].oper_status) {
+        auto* f = std::get_if<proto::OperationFailure>(&s8->updated_obj_results[0].oper_status->oper_status);
+        CHECK(f != nullptr && f->err_code == 7013 && f->updated_inst_failures.size() == 1);
+    }
+    auto* d9 = response_of<proto::DeleteResp>(seen.del);
+    CHECK(d9 != nullptr && d9->deleted_obj_results.size() == 3);
+    if (d9 && d9->deleted_obj_results.size() == 3) {
+        CHECK(d9->deleted_obj_results[0].oper_status && std::get_if<proto::DeleteOperationSuccess>(&d9->deleted_obj_results[0].oper_status->oper_status));
+        auto* f1 = d9->deleted_obj_results[1].oper_status ? std::get_if<proto::DeleteOperationFailure>(&d9->deleted_obj_results[1].oper_status->oper_status) : nullptr;
+        CHECK(f1 != nullptr && f1->err_code == 7026);
+        auto* f2 = d9->deleted_obj_results[2].oper_status ? std::get_if<proto::DeleteOperationFailure>(&d9->deleted_obj_results[2].oper_status->oper_status) : nullptr;
+        CHECK(f2 != nullptr && f2->err_code == 7001);
+    }
+    auto* a10 = response_of<proto::AddResp>(seen.add);
+    CHECK(a10 != nullptr && a10->created_obj_results.size() == 1);
+    if (a10 && a10->created_obj_results.size() == 1 && a10->created_obj_results[0].oper_status) {
+        auto* f = std::get_if<proto::AddOperationFailure>(&a10->created_obj_results[0].oper_status->oper_status);
+        CHECK(f != nullptr && f->err_code == 7001);
+    }
+    auto* e11 = error_of(seen.op_nodot);
+    CHECK(e11 != nullptr && e11->err_code == 7026);
+    auto* e12 = error_of(seen.op_nohandler);
+    CHECK(e12 != nullptr && e12->err_code == 7001);
+    auto* nr = response_of<proto::NotifyResp>(seen.notify_resp);
+    CHECK(nr != nullptr && nr->subscription_id == "ctl-1");
+    CHECK(seen.notify_resp && seen.notify_resp->header && seen.notify_resp->header->msg_id == "n13");
+
+    auto* dreq = seen.deleted && seen.deleted->body ? std::get_if<proto::Request>(&seen.deleted->body->msg_body) : nullptr;
+    auto* dn = dreq ? std::get_if<proto::Notify>(&dreq->req_type) : nullptr;
+    CHECK(dn != nullptr && dn->subscription_id == "sub-2" && !dn->send_resp);
+    if (dn) {
+        auto* od = std::get_if<proto::ObjectDeletion>(&dn->notification);
+        CHECK(od != nullptr && od->obj_path == "Device.TestApp.Item.2.");
+    }
+    auto* ereq = seen.event && seen.event->body ? std::get_if<proto::Request>(&seen.event->body->msg_body) : nullptr;
+    auto* en = ereq ? std::get_if<proto::Notify>(&ereq->req_type) : nullptr;
+    CHECK(en != nullptr && en->subscription_id == "sub-3");
+    if (en) {
+        auto* ev = std::get_if<proto::Event>(&en->notification);
+        CHECK(ev != nullptr && ev->event_name == "Changed!" && ev->params.at("Reason") == "test");
+    }
+    auto* dereg = seen.dereg && seen.dereg->body ? std::get_if<proto::Request>(&seen.dereg->body->msg_body) : nullptr;
+    CHECK(dereg != nullptr && std::get_if<proto::Deregister>(&dereg->req_type) != nullptr);
+    CHECK(!service.running());
+}
+
+/* ── Register replies the service must refuse, a per-path refusal, and a second start() ── */
+
+static void test_register_reply_variants() {
+    std::puts("test_register_reply_variants");
+
+    std::string sock_path = make_tmp_socket_path();
+    int srv_fd = listen_unix(sock_path);
+    if (srv_fd < 0) { std::puts("  SKIP: cannot bind/listen"); return; }
+
+    std::thread broker([&]() {
+        /* 1: a reply of the wrong type */
+        int fd = broker_accept(srv_fd);
+        if (fd < 0) return;
+        auto reg = read_msg(fd);
+        if (reg && reg->header) send_msg(fd, response_msg(reg->header->msg_id, proto::GetResp{}));
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        ::close(fd);
+        /* 2: one path refused, one accepted */
+        fd = broker_accept(srv_fd);
+        if (fd < 0) return;
+        reg = read_msg(fd);
+        if (reg && reg->header) {
+            proto::RegisterResp resp = register_ok("Device.TestApp.");
+            proto::RegisteredPathResult refused;
+            refused.requested_path = "Device.Other.";
+            refused.oper_status = proto::RegisterOperationStatus{proto::RegisterOperationFailure{7800, "Path already registered"}};
+            resp.registered_path_results.push_back(refused);
+            send_msg(fd, response_msg(reg->header->msg_id, resp));
+        }
+        read_msg(fd);                                      /* Deregister on stop */
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        ::close(fd);
+    });
+
+    TestApp app;
+    UspService service(sock_path, "proto::svc");
+    service.set_timeout(std::chrono::seconds(5));
+    app.describe(service);
+
+    auto wrong = service.start({"Device.TestApp."});
+    auto* err = std::get_if<UspError>(&wrong);
+    CHECK(err != nullptr);
+    if (err) CHECK(err->to_string().find("unexpected response type for REGISTER") != std::string::npos);
+    CHECK(!service.running());
+
+    auto partial = service.start({"Device.TestApp.", "Device.Other."}, true);
+    auto* results = std::get_if<std::vector<RegisterResult>>(&partial);
+    CHECK(results != nullptr);
+    if (results && results->size() == 2) {
+        CHECK(results->at(0).ok);
+        CHECK(!results->at(1).ok && results->at(1).err_code == 7800 && results->at(1).err_msg == "Path already registered");
+    } else {
+        CHECK(false);
+    }
+    CHECK(service.running());
+    CHECK_EQ(service.broker_endpoint_id(), "proto::broker");
+    auto again = service.start({"Device.TestApp."});
+    auto* twice = std::get_if<UspError>(&again);
+    CHECK(twice != nullptr);
+    if (twice) CHECK(twice->to_string().find("already started") != std::string::npos);
+    service.stop();
+    service.stop();                                        /* a second stop is a no-op */
+    broker.join();
+    ::close(srv_fd);
+    ::unlink(sock_path.c_str());
+}
+
+/* ── C API: password, the notifications not yet exercised, callback failures and buffer limits ── */
+
+static int c_add_no_instance(void*, const char*, const char* const*, const char* const*, size_t, char* out, size_t len, UspServiceError*) {
+    return write_text(out, len, "KEY\tName\tx\n");       /* forgot the INSTANCE line */
+}
+
+static int c_del_plain_failure(void*, const char*, UspServiceError* err) {
+    err->code = 0;                                         /* no code: the library's fallback applies */
+    std::snprintf(err->msg, sizeof err->msg, "cannot delete");
+    return USP_ERR_USP;
+}
+
+static void test_c_api_notifications_and_failures() {
+    std::puts("test_c_api_notifications_and_failures");
+
+    std::string sock_path = make_tmp_socket_path();
+    int srv_fd = listen_unix(sock_path);
+    if (srv_fd < 0) { std::puts("  SKIP: cannot bind/listen"); return; }
+
+    struct Seen { std::optional<proto::Msg> get, add, del, operate, deleted, event, dereg; } seen;
+    std::string seen_password;
+    std::promise<void> subscribed;
+    auto subscribed_f = subscribed.get_future();
+
+    std::thread broker([&]() {
+        int fd = broker_accept(srv_fd, &seen_password);
+        if (fd < 0) { subscribed.set_value(); return; }
+        auto reg = read_msg(fd);
+        if (reg && reg->header) {
+            proto::RegisterResp resp = register_ok("Device.TestApp.");
+            proto::RegisteredPathResult refused;
+            refused.requested_path = "Device.Other.";
+            refused.oper_status = proto::RegisterOperationStatus{proto::RegisterOperationFailure{7800, "Path already registered"}};
+            resp.registered_path_results.push_back(refused);
+            send_msg(fd, response_msg(reg->header->msg_id, resp));
+        }
+
+        proto::Get get;                                    /* a value the callback wrote with an escaped tab */
+        get.param_paths = {"Device.TestApp.Item.1.Name"};
+        send_msg(fd, request_msg("f0", get));
+        seen.get = read_msg(fd);
+
+        proto::Add add;
+        proto::CreateObject create;
+        create.obj_path = "Device.TestApp.Item.";
+        add.create_objs = {create};
+        send_msg(fd, request_msg("f1", add));
+        seen.add = read_msg(fd);
+
+        proto::Delete del;
+        del.obj_paths = {"Device.TestApp.Item.1."};
+        send_msg(fd, request_msg("f2", del));
+        seen.del = read_msg(fd);
+
+        proto::Operate op;
+        op.command = "Device.TestApp.Other()";
+        send_msg(fd, request_msg("f3", op));
+        seen.operate = read_msg(fd);
+
+        proto::Add subs;
+        subs.create_objs = {subscription_create("sub-d", "ObjectDeletion", "Device.TestApp.Item."),
+                            subscription_create("sub-e", "Event", "Device.TestApp.Changed!")};
+        send_msg(fd, request_msg("f4", subs));
+        read_msg(fd);
+        subscribed.set_value();
+
+        seen.deleted = read_msg(fd);
+        seen.event = read_msg(fd);
+        seen.dereg = read_msg(fd);
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        ::close(fd);
+    });
+
+    CStore store;
+    store.items["Device.TestApp.Item.1."]["Name"] = "a\\tb";  /* the callback text format escapes a tab as \t */
+    UspServiceHandle* h = usp_service_new(sock_path.c_str(), "proto::svc", "proto::broker", 5);
+    CHECK(h != nullptr);
+    if (h) {
+        CHECK_EQ(usp_service_set_password(nullptr, "pw"), USP_ERR_NULL_POINTER);
+        CHECK_EQ(usp_service_set_password(h, nullptr), USP_ERR_NULL_POINTER);
+        CHECK_EQ(usp_service_set_password(h, "pw-c"), USP_OK);
+        CHECK_EQ(usp_service_add_object(h, "Device.TestApp.", 0, USP_OBJ_ACCESS_READ_ONLY, nullptr), USP_OK);
+        CHECK_EQ(usp_service_add_event(h, "Device.TestApp.", "Changed!", "Reason"), USP_OK);
+        CHECK_EQ(usp_service_add_object(h, "Device.TestApp.Item.{i}.", 1, USP_OBJ_ACCESS_ADD_DELETE, "Name"), USP_OK);
+        CHECK_EQ(usp_service_add_param(h, "Device.TestApp.Item.{i}.", "Name", USP_PARAM_ACCESS_READ_WRITE, USP_PARAM_TYPE_STRING), USP_OK);
+        UspServiceCallbacks cb{};
+        cb.user_data = &store;
+        cb.get = c_get; cb.instances = c_instances; cb.add = c_add_no_instance; cb.del = c_del_plain_failure; cb.operate = c_operate;
+        CHECK_EQ(usp_service_set_callbacks(h, &cb), USP_OK);
+
+        char tiny[4] = {0};
+        const char* roots[] = {"Device.TestApp.", "Device.Other."};
+        char result[128] = {0};
+        CHECK_EQ(usp_service_start(h, roots, 2, 1, result, sizeof result), USP_OK);
+        CHECK_EQ(std::string(result), "REGISTERED\tDevice.TestApp.\nERROR\tDevice.Other.\t7800\tPath already registered\n");
+        CHECK_EQ(usp_service_running(h), 1);
+        CHECK_EQ(usp_service_start(h, roots, 1, 0, result, sizeof result), USP_ERR_USP);
+        char err[256] = {0};
+        usp_service_last_error(h, err, sizeof err);
+        CHECK(std::string(err).find("already started") != std::string::npos);
+        CHECK_EQ(usp_service_broker_endpoint_id(h, tiny, sizeof tiny), USP_ERR_BUFFER_TOO_SMALL);
+        CHECK_EQ(usp_service_broker_endpoint_id(nullptr, result, sizeof result), USP_ERR_NULL_POINTER);
+
+        CHECK(subscribed_f.wait_for(std::chrono::seconds(10)) == std::future_status::ready);
+        CHECK_EQ(usp_service_object_deleted(nullptr, "Device.TestApp.Item.1."), USP_ERR_NULL_POINTER);
+        CHECK_EQ(usp_service_object_deleted(h, nullptr), USP_ERR_NULL_POINTER);
+        CHECK_EQ(usp_service_object_created(h, nullptr, nullptr, nullptr, 0), USP_ERR_NULL_POINTER);
+        CHECK_EQ(usp_service_event(h, nullptr, "Changed!", nullptr, nullptr, 0), USP_ERR_NULL_POINTER);
+        CHECK_EQ(usp_service_event(h, "Device.TestApp.", nullptr, nullptr, nullptr, 0), USP_ERR_NULL_POINTER);
+        const char* names[] = {"Reason"};
+        CHECK_EQ(usp_service_event(h, "Device.TestApp.", "Changed!", names, nullptr, 1), USP_ERR_NULL_POINTER);
+        const char* values[] = {"c"};
+        CHECK_EQ(usp_service_object_deleted(h, "Device.TestApp.Item.1."), USP_OK);
+        CHECK_EQ(usp_service_event(h, "Device.TestApp.", "Changed!", names, values, 1), USP_OK);
+        CHECK_EQ(usp_service_stop(h), USP_OK);             /* the Deregister the broker is waiting for */
+        broker.join();
+        usp_service_free(h);
+    } else {
+        broker.join();
+    }
+    ::close(srv_fd);
+    ::unlink(sock_path.c_str());
+
+    CHECK_EQ(seen_password, "pw-c");
+    auto* g0 = response_of<proto::GetResp>(seen.get);
+    CHECK(g0 != nullptr && g0->req_path_results.size() == 1 && g0->req_path_results[0].resolved_path_results.size() == 1);
+    if (g0 && g0->req_path_results.size() == 1 && g0->req_path_results[0].resolved_path_results.size() == 1)
+        CHECK_EQ(g0->req_path_results[0].resolved_path_results[0].result_params.at("Name"), "a\tb");
+    auto* e1 = error_of(seen.add);
+    CHECK(e1 != nullptr && e1->err_code == 7017);
+    auto* e2 = error_of(seen.del);
+    CHECK(e2 != nullptr && e2->err_code == 7024 && e2->err_msg == "cannot delete");
+    auto* op = response_of<proto::OperateResp>(seen.operate);
+    CHECK(op != nullptr && op->operation_results.size() == 1);
+    if (op && op->operation_results.size() == 1) {
+        auto* f = std::get_if<proto::CommandFailure>(&op->operation_results[0].operation_resp);
+        CHECK(f != nullptr && f->err_code == 7022);
+    }
+    auto* dreq = seen.deleted && seen.deleted->body ? std::get_if<proto::Request>(&seen.deleted->body->msg_body) : nullptr;
+    auto* dn = dreq ? std::get_if<proto::Notify>(&dreq->req_type) : nullptr;
+    CHECK(dn != nullptr && dn->subscription_id == "sub-d" && std::get_if<proto::ObjectDeletion>(&dn->notification) != nullptr);
+    auto* ereq = seen.event && seen.event->body ? std::get_if<proto::Request>(&seen.event->body->msg_body) : nullptr;
+    auto* en = ereq ? std::get_if<proto::Notify>(&ereq->req_type) : nullptr;
+    CHECK(en != nullptr && en->subscription_id == "sub-e");
+    if (en) {
+        auto* ev = std::get_if<proto::Event>(&en->notification);
+        CHECK(ev != nullptr && ev->params.at("Reason") == "c");
+    }
+    auto* dereg = seen.dereg && seen.dereg->body ? std::get_if<proto::Request>(&seen.dereg->body->msg_body) : nullptr;
+    CHECK(dereg != nullptr && std::get_if<proto::Deregister>(&dereg->req_type) != nullptr);
+}
+
 int main() {
     ::signal(SIGPIPE, SIG_IGN);
 
@@ -1229,6 +1744,9 @@ int main() {
     test_start_retries_after_dropped_connection();
     test_c_api_guards();
     test_c_api_exchange();
+    test_subscription_table_and_nested_objects();
+    test_register_reply_variants();
+    test_c_api_notifications_and_failures();
 
     std::printf("\n%s: %d passed, %d failed\n", (g_fail == 0) ? "PASS" : "FAIL", g_pass, g_fail);
     return g_fail != 0 ? 1 : 0;
